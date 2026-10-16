@@ -1,0 +1,12 @@
+# ignore all saved models and runs
+*.pth
+*.pt
+*.zip
+
+__pycache__/
+data/
+checkpoints/
+runs/
+
+MambaIR
+basicsr
