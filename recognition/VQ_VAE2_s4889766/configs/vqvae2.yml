@@ -17,6 +17,9 @@ train:
   batch_size: 64
   lr: 3.0e-4
   epochs: 100            # early-stop on val SSIM
+  patience: 10           # stop after this many epochs without a val SSIM gain
+  min_delta: 1.0e-4      # smallest val SSIM gain that counts as improvement
+  seed: 0
 prior_top:
   channels: 256
   layers: 12
