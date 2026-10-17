@@ -1,0 +1,163 @@
+"""
+Data loading for the HipMRI 2D prostate slices.
+
+Expects the keras_slices_data layout, where each split lives in its own folder:
+
+    <root>/keras_slices_train/case_004_week_0_slice_0.nii.gz
+    <root>/keras_slices_validate/...
+    <root>/keras_slices_test/...
+
+Each slice is loaded with nibabel, has any stray third dimension dropped, is
+center-cropped (or zero-padded) to a fixed size, then normalised per slice by
+clipping at a high percentile and scaling to [0, 1].
+"""
+import os
+import re
+from dataclasses import dataclass
+
+import nibabel as nib
+import numpy as np
+import torch
+from torch.utils.data import Dataset
+from tqdm import tqdm
+
+SPLITS = ("train", "validate", "test")
+FILENAME_PATTERN = re.compile(r"^case_(\d+)_week_(\d+)_slice_(\d+)\.nii(?:\.gz)?$")
+
+
+@dataclass(frozen=True)
+class SliceRecord:
+    path: str
+    case: int
+    week: int
+    slice: int
+
+
+def parse_filename(path: str) -> SliceRecord:
+    """Parse case (patient) ID, week and slice index from a slice filename."""
+    match = FILENAME_PATTERN.match(os.path.basename(path))
+    if match is None:
+        raise ValueError(f"Unexpected slice filename: {path}")
+    case, week, slice_idx = (int(g) for g in match.groups())
+    return SliceRecord(path, case, week, slice_idx)
+
+
+def load_slice(path: str) -> np.ndarray:
+    """Load a single 2D slice as float32, removing the extra dim some files have."""
+    image = nib.load(path).get_fdata(caching="unchanged")
+    if image.ndim == 3:
+        image = image[:, :, 0] # sometimes extra dims in HipMRI_study data
+    return image.astype(np.float32)
+
+
+def fit_to_size(image: np.ndarray, size: tuple[int, int]) -> np.ndarray:
+    """
+    Center-crop or zero-pad an image to size.
+
+    One training volume (case 019, week 1) is 256 x 144 rather than 256 x 128.
+    Its pixel spacing matches the rest of the data, so cropping keeps the
+    anatomy at the same scale where resizing would squash it along one axis.
+    """
+    out = np.zeros(size, dtype=image.dtype)
+    src, dst = [], []
+    for have, want in zip(image.shape, size):
+        if have >= want:
+            start = (have - want) // 2
+            src.append(slice(start, start + want))
+            dst.append(slice(0, want))
+        else:
+            start = (want - have) // 2
+            src.append(slice(0, have))
+            dst.append(slice(start, start + have))
+    out[tuple(dst)] = image[tuple(src)]
+    return out
+
+
+def normalise(image: np.ndarray, clip_percentile: float = 99.5) -> np.ndarray:
+    """Clip a slice at its clip_percentile intensity and min-max scale to [0, 1]."""
+    high = np.percentile(image, clip_percentile)
+    image = np.clip(image, None, high)
+    low = image.min()
+    if high - low < 1e-8: # blank slice
+        return np.zeros_like(image)
+    return (image - low) / (high - low)
+
+
+class HipMRISlices(Dataset):
+    """
+    One split of the HipMRI 2D slices, returning (1, H, W) float tensors in [0, 1].
+
+    root: folder containing the keras_slices_{train, validate, test} folders
+    split: one of "train", "validate", "test"
+    size: (rows, cols) every slice is cropped or padded to
+    clip_percentile: per-slice upper intensity percentile to clip at
+    preload: load and preprocess every slice into memory up front, rather
+        than reading from disk in __getitem__ (train is ~1.5 GB as float32)
+    """
+
+    def __init__(self, root: str, split: str, size=(256, 128),
+                 clip_percentile: float = 99.5, preload: bool = True):
+        if split not in SPLITS:
+            raise ValueError(f"split must be one of {SPLITS}, got {split!r}")
+        self.split = split
+        self.size = tuple(size)
+        self.clip_percentile = clip_percentile
+
+        folder = os.path.join(root, f"keras_slices_{split}")
+        names = [n for n in os.listdir(folder) if n.endswith((".nii", ".nii.gz"))]
+        if not names:
+            raise FileNotFoundError(f"No NIfTI slices found in {folder}")
+        self.records = sorted((parse_filename(os.path.join(folder, n)) for n in names),
+                              key=lambda r: (r.case, r.week, r.slice))
+
+        self.images = None
+        if preload:
+            self.images = torch.stack([self._load(r.path)
+                                       for r in tqdm(self.records, desc=f"Loading {split}")])
+
+    @property
+    def cases(self) -> set[int]:
+        return {r.case for r in self.records}
+
+    def _load(self, path: str) -> torch.Tensor:
+        image = fit_to_size(load_slice(path), self.size)
+        image = normalise(image, self.clip_percentile)
+        return torch.from_numpy(image).unsqueeze(0)
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def __getitem__(self, idx: int) -> torch.Tensor:
+        if self.images is not None:
+            return self.images[idx]
+        return self._load(self.records[idx].path)
+
+
+def check_no_patient_leakage(datasets: dict[str, HipMRISlices]) -> None:
+    """Assert that no case (patient) ID appears in more than one split."""
+    names = list(datasets)
+    for i, a in enumerate(names):
+        for b in names[i + 1:]:
+            shared = datasets[a].cases & datasets[b].cases
+            assert not shared, f"Patients {sorted(shared)} appear in both {a} and {b}"
+
+
+def build_datasets(root: str, size=(256, 128), clip_percentile: float = 99.5,
+                   preload: bool = True) -> dict[str, HipMRISlices]:
+    """Build the train, validate and test splits and check they share no patients."""
+    datasets = {split: HipMRISlices(root, split, size, clip_percentile, preload)
+                for split in SPLITS}
+    check_no_patient_leakage(datasets)
+    return datasets
+
+
+if __name__ == "__main__":
+    import sys
+
+    root = sys.argv[1] if len(sys.argv) > 1 else "data/keras_slices_data"
+    datasets = build_datasets(root)
+    for split, ds in datasets.items():
+        x = ds.images
+        print(f"{split:>8}: {len(ds):>5} slices, {len(ds.cases):>2} patients, "
+              f"shape {tuple(x.shape[1:])}, range [{x.min():.3f}, {x.max():.3f}]")
+    print("No patient appears in more than one split.")
