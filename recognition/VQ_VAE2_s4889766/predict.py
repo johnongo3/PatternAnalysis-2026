@@ -1,13 +1,24 @@
 """
-Evaluate a trained VQ-VAE-2 run on the test split and save figures.
+Evaluate and sample from a trained VQ-VAE-2 run.
 
-Usage: python predict.py RUN_DIR [--root DATA_ROOT] [--n 6] [--seed 0] [--out assets]
+Usage:
+    python predict.py RUN_DIR [--root DATA_ROOT] [--n 6] [--seed 0] [--out assets]
+    python predict.py RUN_DIR --sample [--temperatures 0.8 1.0] [--n-samples N]
 
-Loads RUN_DIR/best.pt (the highest validation SSIM) and reports test MSE, SSIM
-and PSNR for the full reconstruction, plus the top level alone for two-level
-models. Metrics are written to RUN_DIR/test_metrics.json, and to --out:
-    loss_curves_<run>.png      training curves from RUN_DIR/last.pt
+Reconstruction (the default) loads RUN_DIR/best.pt (the highest validation
+SSIM) and reports test MSE, SSIM and PSNR for the full reconstruction, plus the
+top level alone for two-level models. Metrics go to RUN_DIR/test_metrics.json,
+and to --out:
+    loss_curves_<run>.png      stage-1 training curves
     reconstructions_<run>.png  test slices: original, top only, full, |error|
+
+Sampling (--sample) needs the priors from train.py --stage top and --stage
+bottom. For each temperature it samples top codes from the top prior, then
+bottom codes from the bottom prior given those, then decodes them with the
+stage-1 decoder, in batches from a fixed seed. Images and codes go to
+RUN_DIR/samples/samples_t<T>.pt, and to --out:
+    samples_<run>.png          the first --n samples at each temperature
+    prior_nll_<run>.png        train and validation bits per code of both priors
 """
 import argparse
 import json
@@ -19,16 +30,11 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from dataset import HipMRISlices
-from train import PROJECT_DIR, build_model, pick_device
-from utils import plot_history, plot_reconstructions, psnr, ssim
+from utils import (load_checkpoint, load_prior, load_vqvae, pick_device, plot_prior_history,
+                   plot_reconstructions, plot_samples, plot_vqvae_history, prior_dir, psnr,
+                   save_atomic, ssim)
 
-
-def load_run(run_dir: str, device: torch.device):
-    """Load the best-SSIM model and its config from a run directory."""
-    ckpt = torch.load(os.path.join(run_dir, "best.pt"), map_location="cpu", weights_only=True)
-    model = build_model(ckpt["config"])
-    model.load_state_dict(ckpt["model"])
-    return model.to(device).eval(), ckpt
+PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 @torch.no_grad()
@@ -55,17 +61,29 @@ def evaluate(model, loader, device) -> dict:
     return results
 
 
-def main():
-    p = argparse.ArgumentParser(description="Evaluate a VQ-VAE-2 run on the test split.")
-    p.add_argument("run_dir")
-    p.add_argument("--root", help="data root (default: data.root in the run's config)")
-    p.add_argument("--n", type=int, default=6, help="test slices in the reconstruction grid")
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--out", default=os.path.join(PROJECT_DIR, "assets"))
-    args = p.parse_args()
+@torch.no_grad()
+def sample_images(vqvae, top_prior, bottom_prior, n: int, temperature: float, seed: int,
+                  batch_size: int, device: torch.device) -> dict[str, torch.Tensor]:
+    """
+    Generate n slices: top prior, then bottom prior given the top codes, then the
+    stage-1 decoder. One generator seeded once drives every batch, so a given
+    (seed, batch_size) always gives the same samples.
+    """
+    generator = torch.Generator(device=device).manual_seed(seed)
+    out = {"images": [], "top": [], "bottom": []}
+    for start in range(0, n, batch_size):
+        b = min(batch_size, n - start)
+        top = top_prior.sample(b, temperature, generator)
+        bottom = bottom_prior.sample(top, temperature, generator)
+        out["images"].append(vqvae.decode_codes(bottom, top).clamp(0, 1).cpu())
+        out["top"].append(top.to(torch.int16).cpu())
+        out["bottom"].append(bottom.to(torch.int16).cpu())
+        print(f"  T={temperature:g}: {start + b}/{n} samples")
+    return {k: torch.cat(v) for k, v in out.items()}
 
-    device = pick_device()
-    model, ckpt = load_run(args.run_dir, device)
+
+def reconstruct(args, device: torch.device):
+    model, ckpt = load_vqvae(args.run_dir, device)
     cfg = ckpt["config"]
     run_name = os.path.basename(os.path.normpath(args.run_dir))
     print(f"Loaded {run_name} from epoch {ckpt['epoch']} "
@@ -81,11 +99,10 @@ def main():
         print(f"test {key:>15}: {v['mean']:.4f} ± {v['std']:.4f}")
 
     os.makedirs(args.out, exist_ok=True)
-    last_path = os.path.join(args.run_dir, "last.pt")
-    if os.path.exists(last_path):
-        history = torch.load(last_path, map_location="cpu", weights_only=True)["history"]
-        plot_history(history, os.path.join(args.out, f"loss_curves_{run_name}.png"),
-                     model.level_names)
+    if os.path.exists(os.path.join(args.run_dir, "last.pt")):
+        history = load_checkpoint(args.run_dir, "last.pt")["history"]
+        plot_vqvae_history(history, os.path.join(args.out, f"loss_curves_{run_name}.png"),
+                           model.level_names)
 
     rng = np.random.default_rng(args.seed)
     idx = np.sort(rng.choice(len(test), size=args.n, replace=False))
@@ -101,6 +118,60 @@ def main():
               f"sl {test.records[i].slice}" for i in idx]
     plot_reconstructions(columns, titles, os.path.join(args.out, f"reconstructions_{run_name}.png"))
     print(f"Saved figures to {args.out}")
+
+
+def sample(args, device: torch.device):
+    vqvae, _ = load_vqvae(args.run_dir, device)
+    top_prior, top_ckpt = load_prior(args.run_dir, "top", device)
+    bottom_prior, bottom_ckpt = load_prior(args.run_dir, "bottom", device)
+    sample_cfg = bottom_ckpt["config"]["sample"]
+    temperatures = args.temperatures or sample_cfg["temperatures"]
+    n = args.n_samples or sample_cfg["n_samples"]
+    run_name = os.path.basename(os.path.normpath(args.run_dir))
+    for level, ckpt in [("top", top_ckpt), ("bottom", bottom_ckpt)]:
+        print(f"Loaded {level} prior from epoch {ckpt['epoch']} "
+              f"(val {ckpt['metrics']['val_bits_per_code']:.4f} bits/code)")
+
+    samples_dir = os.path.join(args.run_dir, "samples")
+    os.makedirs(samples_dir, exist_ok=True)
+    os.makedirs(args.out, exist_ok=True)
+    previews = {}
+    for t in temperatures:
+        out = sample_images(vqvae, top_prior, bottom_prior, n, t, sample_cfg["seed"],
+                            sample_cfg["batch_size"], device)
+        save_atomic({"images": out["images"].half(), "top": out["top"],
+                     "bottom": out["bottom"], "temperature": t, "seed": sample_cfg["seed"]},
+                    os.path.join(samples_dir, f"samples_t{t:g}.pt"))
+        previews[t] = out["images"][:args.n]
+
+    plot_samples(previews, os.path.join(args.out, f"samples_{run_name}.png"))
+    histories = {level: load_checkpoint(prior_dir(args.run_dir, level), "last.pt")["history"]
+                 for level in ("top", "bottom")}
+    plot_prior_history(histories, os.path.join(args.out, f"prior_nll_{run_name}.png"))
+    print(f"Saved {n} samples per temperature to {samples_dir} and figures to {args.out}")
+
+
+def main():
+    p = argparse.ArgumentParser(description="Evaluate or sample from a VQ-VAE-2 run.")
+    p.add_argument("run_dir", help="stage-1 run directory, e.g. checkpoints/vqvae2_L2_ssim0")
+    p.add_argument("--sample", action="store_true",
+                   help="generate new slices with the trained priors instead of reconstructing")
+    p.add_argument("--root", help="data root for reconstruction (default: the run's config)")
+    p.add_argument("--n", type=int, default=6,
+                   help="slices per row of the reconstruction or sample figure")
+    p.add_argument("--seed", type=int, default=0, help="choice of test slices to reconstruct")
+    p.add_argument("--temperatures", type=float, nargs="+",
+                   help="sampling temperatures (default: sample.temperatures in the config)")
+    p.add_argument("--n-samples", type=int,
+                   help="samples per temperature (default: sample.n_samples in the config)")
+    p.add_argument("--out", default=os.path.join(PROJECT_DIR, "assets"))
+    args = p.parse_args()
+
+    device = pick_device()
+    if args.sample:
+        sample(args, device)
+    else:
+        reconstruct(args, device)
 
 
 if __name__ == "__main__":
