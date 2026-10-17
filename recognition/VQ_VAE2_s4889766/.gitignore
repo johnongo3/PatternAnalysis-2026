@@ -2,6 +2,7 @@
 *.pth
 *.pt
 *.zip
+*.sh
 
 .DS_Store
 
