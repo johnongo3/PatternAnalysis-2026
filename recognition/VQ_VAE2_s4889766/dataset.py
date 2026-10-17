@@ -10,6 +10,12 @@ Expects the keras_slices_data layout, where each split lives in its own folder:
 Each slice is loaded with nibabel, has any stray third dimension dropped, is
 center-cropped (or zero-padded) to a fixed size, then normalised per slice by
 clipping at a high percentile and scaling to [0, 1].
+
+Preprocessed splits are cached as one tensor file each (outside the repo, under
+HIPMRI_CACHE or ~/.cache/hipmri_vqvae2) so later runs skip the per-file decode.
+
+The slices are coronal. Arrays are stored as (256, 128) with superior pointing
+along +columns; use to_display() to rotate a slice upright for plotting.
 """
 import os
 import re
@@ -23,6 +29,8 @@ from tqdm import tqdm
 
 SPLITS = ("train", "validate", "test")
 FILENAME_PATTERN = re.compile(r"^case_(\d+)_week_(\d+)_slice_(\d+)\.nii(?:\.gz)?$")
+DEFAULT_CACHE_DIR = os.environ.get("HIPMRI_CACHE",
+                                   os.path.expanduser("~/.cache/hipmri_vqvae2"))
 
 
 @dataclass(frozen=True)
@@ -83,6 +91,12 @@ def normalise(image: np.ndarray, clip_percentile: float = 99.5) -> np.ndarray:
     return (image - low) / (high - low)
 
 
+def to_display(image):
+    """Rotate a (H, W) or (1, H, W) slice so superior is up, for plotting only."""
+    image = np.asarray(image).squeeze()
+    return np.rot90(image)
+
+
 class HipMRISlices(Dataset):
     """
     One split of the HipMRI 2D slices, returning (1, H, W) float tensors in [0, 1].
@@ -93,10 +107,13 @@ class HipMRISlices(Dataset):
     clip_percentile: per-slice upper intensity percentile to clip at
     preload: load and preprocess every slice into memory up front, rather
         than reading from disk in __getitem__ (train is ~1.5 GB as float32)
+    cache_dir: where preloaded splits are cached as one tensor file each, or
+        None to disable caching. Only used when preload is True.
     """
 
     def __init__(self, root: str, split: str, size=(256, 128),
-                 clip_percentile: float = 99.5, preload: bool = True):
+                 clip_percentile: float = 99.5, preload: bool = True,
+                 cache_dir: str | None = DEFAULT_CACHE_DIR):
         if split not in SPLITS:
             raise ValueError(f"split must be one of {SPLITS}, got {split!r}")
         self.split = split
@@ -111,13 +128,43 @@ class HipMRISlices(Dataset):
                               key=lambda r: (r.case, r.week, r.slice))
 
         self.images = None
-        if preload:
-            self.images = torch.stack([self._load(r.path)
-                                       for r in tqdm(self.records, desc=f"Loading {split}")])
+        if preload and cache_dir is not None:
+            self.images = self._load_cached(cache_dir)
+        elif preload:
+            self.images = self._load_all()
 
     @property
     def cases(self) -> set[int]:
         return {r.case for r in self.records}
+
+    def _load_all(self) -> torch.Tensor:
+        return torch.stack([self._load(r.path)
+                            for r in tqdm(self.records, desc=f"Loading {self.split}")])
+
+    def _load_cached(self, cache_dir: str) -> torch.Tensor:
+        """
+        Load this split from its cache file, building it on first use.
+
+        The file name encodes size and clip_percentile, and the cached filenames
+        are checked against the folder, so changing either rebuilds the cache.
+        """
+        rows, cols = self.size
+        cache_path = os.path.join(
+            cache_dir, f"{self.split}_{rows}x{cols}_p{self.clip_percentile}.pt")
+        names = [os.path.basename(r.path) for r in self.records]
+
+        if os.path.exists(cache_path):
+            cached = torch.load(cache_path, mmap=True, weights_only=True)
+            if cached["names"] == names:
+                return cached["images"]
+            print(f"Cache {cache_path} does not match {self.split} files, rebuilding")
+
+        images = self._load_all()
+        os.makedirs(cache_dir, exist_ok=True)
+        tmp_path = cache_path + ".tmp"
+        torch.save({"images": images, "names": names}, tmp_path)
+        os.replace(tmp_path, cache_path) # no half-written cache if interrupted
+        return images
 
     def _load(self, path: str) -> torch.Tensor:
         image = fit_to_size(load_slice(path), self.size)
@@ -143,9 +190,10 @@ def check_no_patient_leakage(datasets: dict[str, HipMRISlices]) -> None:
 
 
 def build_datasets(root: str, size=(256, 128), clip_percentile: float = 99.5,
-                   preload: bool = True) -> dict[str, HipMRISlices]:
+                   preload: bool = True,
+                   cache_dir: str | None = DEFAULT_CACHE_DIR) -> dict[str, HipMRISlices]:
     """Build the train, validate and test splits and check they share no patients."""
-    datasets = {split: HipMRISlices(root, split, size, clip_percentile, preload)
+    datasets = {split: HipMRISlices(root, split, size, clip_percentile, preload, cache_dir)
                 for split in SPLITS}
     check_no_patient_leakage(datasets)
     return datasets
