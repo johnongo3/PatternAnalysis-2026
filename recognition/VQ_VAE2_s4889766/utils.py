@@ -1,8 +1,18 @@
 """
-Shared helpers for training and evaluation: image quality metrics, code usage
-statistics and figures.
+Shared helpers for training and evaluation: config, device and checkpoint
+handling, image quality metrics, code usage statistics and figures.
+
+Run layout: a stage-1 run directory holds its own checkpoints, the code maps
+encoded with it, and the priors trained on those codes:
+
+    checkpoints/<vqvae_run>/{best,last}.pt, history.csv, loss_curves.png
+    checkpoints/<vqvae_run>/codes/{train,validate,test}.pt
+    checkpoints/<vqvae_run>/prior_top/{best,last}.pt, ...
+    checkpoints/<vqvae_run>/prior_bottom/{best,last}.pt, ...
+    checkpoints/<vqvae_run>/samples/samples_t<temperature>.pt
 """
 import math
+import os
 
 import matplotlib
 matplotlib.use("Agg")
@@ -10,10 +20,63 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.ticker import MaxNLocator
 import torch
+import yaml
 from torchmetrics.functional.image import (peak_signal_noise_ratio,
                                            structural_similarity_index_measure)
 
 from dataset import to_display
+from modules import PixelCNNPrior, VQVAE2, build_prior, build_vqvae
+
+
+def load_config(path: str) -> dict:
+    with open(path) as f:
+        return yaml.safe_load(f)
+
+
+def pick_device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def save_atomic(obj, path: str):
+    """torch.save via a temp file, so an interrupted save never corrupts a checkpoint."""
+    torch.save(obj, path + ".tmp")
+    os.replace(path + ".tmp", path)
+
+
+def codes_dir(vqvae_run: str) -> str:
+    return os.path.join(vqvae_run, "codes")
+
+
+def prior_dir(vqvae_run: str, level: str) -> str:
+    return os.path.join(vqvae_run, f"prior_{level}")
+
+
+def load_checkpoint(run_dir: str, name: str = "best.pt") -> dict:
+    path = os.path.join(run_dir, name)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"No checkpoint at {path}")
+    return torch.load(path, map_location="cpu", weights_only=True)
+
+
+def load_vqvae(run_dir: str, device: torch.device) -> tuple[VQVAE2, dict]:
+    """The best-SSIM stage-1 model of a run, frozen in eval mode, and its checkpoint."""
+    ckpt = load_checkpoint(run_dir)
+    model = build_vqvae(ckpt["config"])
+    model.load_state_dict(ckpt["model"])
+    model.requires_grad_(False)
+    return model.to(device).eval(), ckpt
+
+
+def load_prior(vqvae_run: str, level: str, device: torch.device) -> tuple[PixelCNNPrior, dict]:
+    """The best-NLL top or bottom prior trained on a stage-1 run's codes."""
+    ckpt = load_checkpoint(prior_dir(vqvae_run, level))
+    model = build_prior(level, ckpt["config"])
+    model.load_state_dict(ckpt["model"])
+    return model.to(device).eval(), ckpt
 
 
 def ssim(recon: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -35,7 +98,7 @@ def perplexity_from_counts(counts: torch.Tensor) -> float:
     return math.exp(-(probs * probs.log()).sum().item())
 
 
-def plot_history(history: list[dict], path: str, levels: tuple[str, ...]):
+def plot_vqvae_history(history: list[dict], path: str, levels: tuple[str, ...]):
     """
     Plot per-epoch losses, code perplexity, and validation SSIM and PSNR for
     the full reconstruction (and the top level alone, for two-level models).
@@ -116,5 +179,46 @@ def plot_reconstructions(columns: dict[str, torch.Tensor], titles: list[str], pa
                 ax.set_ylabel(titles[row], fontsize=8)
         if is_error:
             fig.colorbar(im, ax=axes[:, col].tolist(), shrink=0.6)
+    fig.savefig(path, dpi=100, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_prior_history(histories: dict[str, list[dict]], path: str):
+    """
+    Plot train and validation NLL in bits per code, one panel per prior level,
+    e.g. {"top": top_history, "bottom": bottom_history}.
+    """
+    fig, axes = plt.subplots(1, len(histories), figsize=(6 * len(histories), 4), squeeze=False)
+    for ax, (level, history) in zip(axes[0], histories.items()):
+        epochs = [h["epoch"] for h in history]
+        val = [h["val_bits_per_code"] for h in history]
+        ax.plot(epochs, [h["train_bits_per_code"] for h in history], label="train")
+        ax.plot(epochs, val, label="validate")
+        best = int(np.argmin(val))
+        ax.axvline(epochs[best], color="grey", linestyle=":",
+                   label=f"best {val[best]:.3f} (epoch {epochs[best]})")
+        ax.set_title(f"{level.capitalize()} prior NLL")
+        ax.set_xlabel("epoch")
+        ax.set_ylabel("bits per code")
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+        ax.legend()
+    fig.tight_layout()
+    fig.savefig(path, dpi=100)
+    plt.close(fig)
+
+
+def plot_samples(samples: dict[float, torch.Tensor], path: str):
+    """Grid of generated slices, one row per sampling temperature."""
+    temperatures = list(samples)
+    n = len(samples[temperatures[0]])
+    fig, axes = plt.subplots(len(temperatures), n, figsize=(2.6 * n, 1.5 * len(temperatures)),
+                             squeeze=False, layout="constrained")
+    for row, t in enumerate(temperatures):
+        for col in range(n):
+            ax = axes[row, col]
+            ax.imshow(to_display(samples[t][col].cpu()), cmap="gray", vmin=0, vmax=1)
+            ax.set_xticks([])
+            ax.set_yticks([])
+        axes[row, 0].set_ylabel(f"T = {t:g}")
     fig.savefig(path, dpi=100, bbox_inches="tight")
     plt.close(fig)

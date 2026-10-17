@@ -1,67 +1,54 @@
 """
-Train the VQ-VAE-2 on the HipMRI slices.
+Train every stage of the VQ-VAE-2 pipeline on the HipMRI slices.
+
+Stages, run in this order:
+    vqvae   stage 1, the VQ-VAE-2 itself (the default)
+    encode  encode every split with the frozen stage-1 model into integer code maps
+    top     stage 2, the top prior over the top codes
+    bottom  stage 2, the bottom prior over the bottom codes given the true top codes
 
 Usage:
-    python train.py [--config configs/vqvae2.yml] [--root DATA_ROOT] [--levels 1|2]
-                    [--ssim-loss-weight W] [--run-name NAME] [--resume]
+    python train.py [--levels 1|2] [--ssim-loss-weight W] [--resume]
+    python train.py --stage encode [--vqvae-run checkpoints/vqvae2_L2_ssim0]
+    python train.py --stage top    [--vqvae-run checkpoints/vqvae2_L2_ssim0] [--resume]
+    python train.py --stage bottom [--vqvae-run checkpoints/vqvae2_L2_ssim0] [--resume]
 
-Each epoch logs, to the console and <run_dir>/history.csv: train and validation
-reconstruction loss, train commitment loss and code perplexity per level, and
-validation SSIM, PSNR and perplexity per level. best.pt keeps the weights with
-the highest validation SSIM, and last.pt holds the full training state for
---resume. Training stops early once validation SSIM has not improved by
-min_delta for `patience` epochs.
+Every training stage runs through the same loop (fit): train and validate each
+epoch, log to <run_dir>/history.csv and loss_curves.png, keep best.pt on the
+monitored validation metric (SSIM for stage 1, NLL in bits per code for the
+priors) and last.pt for --resume, and stop early after `patience` epochs without
+improvement. The prior stages encode the codes first if they are missing or
+came from an older stage-1 checkpoint.
 """
 import argparse
 import csv
+import math
 import os
 import random
 import time
 
 import torch
 import torch.nn.functional as F
-import yaml
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from dataset import build_datasets
-from modules import VQVAE2
-from utils import perplexity_from_counts, plot_history, psnr, ssim
+from dataset import SPLITS, CodeDataset, build_datasets, encode_dataset
+from modules import build_prior, build_vqvae
+from utils import (codes_dir, load_checkpoint, load_config, load_vqvae, perplexity_from_counts,
+                   pick_device, plot_prior_history, plot_vqvae_history, prior_dir, psnr,
+                   save_atomic, ssim)
 
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
-def load_config(path: str) -> dict:
-    with open(path) as f:
-        return yaml.safe_load(f)
+# Per-epoch functions: one pass over a loader, training when given an optimizer.
 
-
-def pick_device() -> torch.device:
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
-
-
-def build_model(cfg: dict) -> VQVAE2:
-    """Build a VQVAE2 from the vqvae section of the config."""
-    kwargs = {k: v for k, v in cfg["vqvae"].items() if k != "ssim_loss_weight"}
-    return VQVAE2(in_channels=1, **kwargs)
-
-
-def save_atomic(obj, path: str):
-    """torch.save via a temp file, so an interrupted save never corrupts a checkpoint."""
-    torch.save(obj, path + ".tmp")
-    os.replace(path + ".tmp", path)
-
-
-def run_epoch(model, loader, device, optimizer=None, ssim_weight=0.0, limit_batches=None):
+def vqvae_epoch(model, loader, device, optimizer=None, ssim_weight=0.0, limit_batches=None):
     """
-    One pass over loader. Trains when an optimizer is given; otherwise evaluates
-    (no codebook updates) and also computes SSIM and PSNR. Losses and metrics
-    are averaged per image, and perplexity is taken from the code usage
-    histogram over the whole epoch rather than averaged over batches.
+    One pass of the VQ-VAE-2. Evaluation (no optimizer) makes no codebook
+    updates and also computes SSIM and PSNR. Losses and metrics are averaged per
+    image, and perplexity is taken from the code usage histogram over the whole
+    epoch rather than averaged over batches.
     """
     training = optimizer is not None
     model.train(training)
@@ -113,6 +100,59 @@ def run_epoch(model, loader, device, optimizer=None, ssim_weight=0.0, limit_batc
     return metrics
 
 
+def prior_epoch(model, level, loader, device, optimizer=None, limit_batches=None):
+    """
+    One pass of a prior over (top, bottom) code batches. The top prior models the
+    top codes; the bottom prior models the bottom codes given the true top codes
+    (teacher forcing). Returns NLL in bits per code and next-code accuracy.
+    """
+    training = optimizer is not None
+    model.train(training)
+    prefix = "train" if training else "val"
+    nll_sum, correct, n_codes = 0.0, 0, 0
+
+    with torch.set_grad_enabled(training):
+        for i, (top, bottom) in enumerate(tqdm(loader, desc=prefix, leave=False, disable=None)):
+            if limit_batches is not None and i >= limit_batches:
+                break
+            top, bottom = top.to(device, non_blocking=True), bottom.to(device, non_blocking=True)
+            if level == "top":
+                target, logits = top, model(top)
+            else:
+                target, logits = bottom, model(bottom, top)
+            loss = F.cross_entropy(logits, target)
+
+            if training:
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                optimizer.step()
+
+            nll_sum += loss.item() * target.numel()
+            correct += (logits.argmax(1) == target).sum().item()
+            n_codes += target.numel()
+
+    return {f"{prefix}_bits_per_code": nll_sum / n_codes / math.log(2),
+            f"{prefix}_accuracy": correct / n_codes}
+
+
+def format_vqvae_epoch(r: dict, epochs: int, levels: tuple[str, ...], improved: bool) -> str:
+    commit = " ".join(f"{lv[0]} {r[f'train_commit_{lv}']:.2e}" for lv in levels)
+    ppl = " ".join(f"{lv[0]} {r[f'train_perplexity_{lv}']:.0f}/{r[f'val_perplexity_{lv}']:.0f}"
+                   for lv in levels)
+    return (f"epoch {r['epoch']:3d}/{epochs}  recon {r['train_recon']:.5f}/{r['val_recon']:.5f}"
+            f"  commit {commit}  val SSIM {r['val_ssim']:.4f} PSNR {r['val_psnr']:.2f}"
+            f"  ppl {ppl}  {r['seconds']:.0f}s" + ("  * best" if improved else ""))
+
+
+def format_prior_epoch(r: dict, epochs: int, improved: bool) -> str:
+    return (f"epoch {r['epoch']:3d}/{epochs}"
+            f"  bits/code {r['train_bits_per_code']:.4f}/{r['val_bits_per_code']:.4f}"
+            f"  accuracy {r['train_accuracy']:.3f}/{r['val_accuracy']:.3f}"
+            f"  {r['seconds']:.0f}s" + ("  * best" if improved else ""))
+
+
+# The epoch loop shared by every training stage.
+
 def write_history(history: list[dict], path: str):
     # union of keys, so a resumed run that gained new metrics still writes
     fieldnames = list(dict.fromkeys(k for record in history for k in record))
@@ -122,27 +162,223 @@ def write_history(history: list[dict], path: str):
         writer.writerows(history)
 
 
-def format_epoch(r: dict, epochs: int, levels: tuple[str, ...], improved: bool) -> str:
-    commit = " ".join(f"{lv[0]} {r[f'train_commit_{lv}']:.2e}" for lv in levels)
-    ppl = " ".join(f"{lv[0]} {r[f'train_perplexity_{lv}']:.0f}/{r[f'val_perplexity_{lv}']:.0f}"
-                   for lv in levels)
-    return (f"epoch {r['epoch']:3d}/{epochs}  recon {r['train_recon']:.5f}/{r['val_recon']:.5f}"
-            f"  commit {commit}  val SSIM {r['val_ssim']:.4f} PSNR {r['val_psnr']:.2f}"
-            f"  ppl {ppl}  {r['seconds']:.0f}s" + ("  * best" if improved else ""))
+def fit(model, optimizer, run_epoch, train_loader, val_loader, loader_rng, run_dir: str,
+        cfg: dict, train_cfg: dict, monitor: str, mode: str, describe, plot, resume: bool):
+    """
+    Train, validate, log, checkpoint and early-stop, resuming from
+    <run_dir>/last.pt when asked.
+
+    run_epoch(loader, optimizer=None): one pass, returning train_/val_ metrics
+    monitor: validation metric that selects best.pt and drives early stopping
+    mode: "max" if a higher monitor value is better, "min" if lower is better
+    describe(record, improved): the console line for an epoch
+    plot(history, path): draws the training curves
+    """
+    last_path = os.path.join(run_dir, "last.pt")
+    best_path = os.path.join(run_dir, "best.pt")
+    epochs, patience, min_delta = train_cfg["epochs"], train_cfg["patience"], train_cfg["min_delta"]
+    sign = 1 if mode == "max" else -1
+    history, best, stale_epochs, start_epoch = [], None, 0, 1
+
+    if os.path.exists(last_path):
+        if not resume:
+            raise SystemExit(f"{last_path} already exists. Pass --resume to continue "
+                             "that run, or choose a new run directory.")
+        state = torch.load(last_path, map_location="cpu", weights_only=True)
+        model.load_state_dict(state["model"])
+        optimizer.load_state_dict(state["optimizer"])
+        loader_rng.set_state(state["loader_rng"])
+        torch.set_rng_state(state["torch_rng"])
+        history, stale_epochs = state["history"], state["stale_epochs"]
+        start_epoch = state["epoch"] + 1
+        best = state.get("best", state.get("best_ssim")) # best_ssim: older stage-1 runs
+        print(f"Resumed {run_dir} from epoch {state['epoch']} (best {monitor} {best:.4f})")
+        if stale_epochs >= patience:
+            print(f"Run already stopped early ({stale_epochs} epochs without improvement)")
+            return
+    os.makedirs(run_dir, exist_ok=True)
+
+    for epoch in range(start_epoch, epochs + 1):
+        start = time.time()
+        record = {"epoch": epoch, **run_epoch(train_loader, optimizer), **run_epoch(val_loader)}
+        record["seconds"] = round(time.time() - start, 1)
+        history.append(record)
+
+        improved = best is None or sign * (record[monitor] - best) > min_delta
+        if improved:
+            best, stale_epochs = record[monitor], 0
+            save_atomic({"model": model.state_dict(), "config": cfg, "epoch": epoch,
+                         "metrics": record}, best_path)
+        else:
+            stale_epochs += 1
+
+        save_atomic({"model": model.state_dict(), "optimizer": optimizer.state_dict(),
+                     "config": cfg, "epoch": epoch, "history": history, "best": best,
+                     "stale_epochs": stale_epochs, "loader_rng": loader_rng.get_state(),
+                     "torch_rng": torch.get_rng_state()}, last_path)
+        write_history(history, os.path.join(run_dir, "history.csv"))
+        plot(history, os.path.join(run_dir, "loss_curves.png"))
+        print(describe(record, improved))
+
+        if stale_epochs >= patience:
+            print(f"Early stopping: {monitor} has not improved by {min_delta} "
+                  f"for {patience} epochs (best {best:.4f})")
+            break
+
+    print(f"Done. Best {monitor} {best:.4f}; checkpoints in {run_dir}")
+
+
+# Stage setup.
+
+def make_loaders(train_set, val_set, batch_size: int, seed: int, num_workers: int,
+                 device: torch.device):
+    """Shuffled train and ordered validation loaders, plus the shuffle RNG for resuming."""
+    loader_rng = torch.Generator().manual_seed(seed)
+    kwargs = dict(batch_size=batch_size, num_workers=num_workers,
+                  pin_memory=device.type == "cuda", persistent_workers=num_workers > 0)
+    return (DataLoader(train_set, shuffle=True, generator=loader_rng, **kwargs),
+            DataLoader(val_set, shuffle=False, **kwargs), loader_rng)
+
+
+def seed_everything(seed: int):
+    random.seed(seed)
+    torch.manual_seed(seed)
+
+
+def stage_train_config(cfg: dict, section: str, args) -> dict:
+    """The stage's training section, with --epochs and --patience applied."""
+    if args.epochs is not None:
+        cfg[section]["epochs"] = args.epochs
+    if args.patience is not None:
+        cfg[section]["patience"] = args.patience
+    return cfg[section]
+
+
+def use_saved_architecture(run_dir: str, cfg: dict, section: str, resume: bool):
+    """When resuming, rebuild the model with the architecture it was trained with."""
+    last_path = os.path.join(run_dir, "last.pt")
+    if resume and os.path.exists(last_path):
+        saved = torch.load(last_path, map_location="cpu", weights_only=True)["config"]
+        if saved[section] != cfg[section]:
+            print(f"Resuming with the {section} config saved in the checkpoint")
+        cfg[section] = saved[section]
+
+
+def default_vqvae_run(cfg: dict) -> str:
+    return f"vqvae2_L{cfg['vqvae']['levels']}_ssim{cfg['vqvae']['ssim_loss_weight']:g}"
+
+
+def count_params(model) -> str:
+    return f"{sum(p.numel() for p in model.parameters()) / 1e6:.2f}M params"
+
+
+def train_vqvae(args, cfg: dict, device: torch.device):
+    run_dir = os.path.join(args.checkpoint_dir, args.run_name or default_vqvae_run(cfg))
+    use_saved_architecture(run_dir, cfg, "vqvae", args.resume)
+    train_cfg = stage_train_config(cfg, "train", args)
+    seed_everything(train_cfg["seed"])
+
+    datasets = build_datasets(args.root or cfg["data"]["root"], cfg["data"]["size"],
+                              cfg["data"]["clip_percentile"])
+    train_loader, val_loader, loader_rng = make_loaders(
+        datasets["train"], datasets["validate"], train_cfg["batch_size"], train_cfg["seed"],
+        args.num_workers, device)
+    model = build_vqvae(cfg).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=train_cfg["lr"])
+    levels, ssim_weight = model.level_names, cfg["vqvae"]["ssim_loss_weight"]
+    print(f"Training {run_dir} on {device}: {len(datasets['train'])} train / "
+          f"{len(datasets['validate'])} validate slices, levels {levels}, {count_params(model)}")
+
+    fit(model, optimizer,
+        lambda loader, opt=None: vqvae_epoch(model, loader, device, opt, ssim_weight,
+                                             args.limit_batches),
+        train_loader, val_loader, loader_rng, run_dir, cfg, train_cfg,
+        monitor="val_ssim", mode="max",
+        describe=lambda r, improved: format_vqvae_epoch(r, train_cfg["epochs"], levels, improved),
+        plot=lambda history, path: plot_vqvae_history(history, path, levels),
+        resume=args.resume)
+
+
+def encode_codes(vqvae_run: str, root: str | None, device: torch.device):
+    """Encode every split with the frozen stage-1 model into <vqvae_run>/codes/<split>.pt."""
+    model, ckpt = load_vqvae(vqvae_run, device)
+    if model.levels != 2:
+        raise SystemExit("The priors need a two-level stage-1 model (vqvae.levels: 2)")
+    cfg = ckpt["config"]
+    datasets = build_datasets(root or cfg["data"]["root"], cfg["data"]["size"],
+                              cfg["data"]["clip_percentile"])
+    os.makedirs(codes_dir(vqvae_run), exist_ok=True)
+    for split, ds in datasets.items():
+        codes = encode_dataset(model, ds, device, cfg["train"]["batch_size"])
+        save_atomic({**codes, "names": [os.path.basename(r.path) for r in ds.records],
+                     "vqvae_epoch": ckpt["epoch"]},
+                    os.path.join(codes_dir(vqvae_run), f"{split}.pt"))
+        print(f"{split:>8}: {len(ds)} slices -> top {tuple(codes['top'].shape[1:])}, "
+              f"bottom {tuple(codes['bottom'].shape[1:])} codes "
+              f"(stage-1 epoch {ckpt['epoch']})")
+
+
+def load_code_datasets(vqvae_run: str, root: str | None,
+                       device: torch.device) -> dict[str, CodeDataset]:
+    """Code datasets for every split, encoding first if missing or made from an older best.pt."""
+    best_epoch = load_checkpoint(vqvae_run)["epoch"]
+    paths = {split: os.path.join(codes_dir(vqvae_run), f"{split}.pt") for split in SPLITS}
+    try:
+        datasets = {split: CodeDataset(path) for split, path in paths.items()}
+        if all(ds.vqvae_epoch == best_epoch for ds in datasets.values()):
+            return datasets
+        print("Saved codes came from an older stage-1 checkpoint, re-encoding")
+    except FileNotFoundError:
+        print("No saved codes yet, encoding")
+    encode_codes(vqvae_run, root, device)
+    return {split: CodeDataset(path) for split, path in paths.items()}
+
+
+def train_prior(level: str, args, cfg: dict, device: torch.device):
+    vqvae_cfg = load_checkpoint(args.vqvae_run)["config"]
+    if vqvae_cfg["vqvae"]["levels"] != 2:
+        raise SystemExit("The priors need a two-level stage-1 model (vqvae.levels: 2)")
+    # stage-1 settings come from its checkpoint, prior settings from the config file
+    cfg["data"], cfg["vqvae"] = vqvae_cfg["data"], vqvae_cfg["vqvae"]
+    run_dir = prior_dir(args.vqvae_run, level)
+    use_saved_architecture(run_dir, cfg, f"prior_{level}", args.resume)
+    train_cfg = stage_train_config(cfg, "train_prior", args)
+    seed_everything(train_cfg["seed"])
+
+    codes = load_code_datasets(args.vqvae_run, args.root, device)
+    train_loader, val_loader, loader_rng = make_loaders(
+        codes["train"], codes["validate"], train_cfg["batch_size"], train_cfg["seed"],
+        args.num_workers, device)
+    model = build_prior(level, cfg).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=train_cfg["lr"])
+    print(f"Training {run_dir} on {device}: {len(codes['train'])} train / "
+          f"{len(codes['validate'])} validate code maps of {model.shape}, {count_params(model)}")
+
+    fit(model, optimizer,
+        lambda loader, opt=None: prior_epoch(model, level, loader, device, opt,
+                                             args.limit_batches),
+        train_loader, val_loader, loader_rng, run_dir, cfg, train_cfg,
+        monitor="val_bits_per_code", mode="min",
+        describe=lambda r, improved: format_prior_epoch(r, train_cfg["epochs"], improved),
+        plot=lambda history, path: plot_prior_history({level: history}, path),
+        resume=args.resume)
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Train the VQ-VAE-2 on HipMRI slices.")
+    p = argparse.ArgumentParser(description="Train the VQ-VAE-2 pipeline on HipMRI slices.")
+    p.add_argument("--stage", choices=("vqvae", "encode", "top", "bottom"), default="vqvae")
     p.add_argument("--config", default=os.path.join(PROJECT_DIR, "configs", "vqvae2.yml"))
     p.add_argument("--root", help="data root (default: data.root in the config)")
     p.add_argument("--levels", type=int, choices=(1, 2), help="override vqvae.levels")
     p.add_argument("--ssim-loss-weight", type=float, help="override vqvae.ssim_loss_weight")
-    p.add_argument("--epochs", type=int, help="override train.epochs")
-    p.add_argument("--patience", type=int, help="override train.patience")
-    p.add_argument("--run-name", help="default: vqvae2_L<levels>_ssim<weight>")
+    p.add_argument("--epochs", type=int, help="override the stage's epochs")
+    p.add_argument("--patience", type=int, help="override the stage's patience")
     p.add_argument("--checkpoint-dir", default=os.path.join(PROJECT_DIR, "checkpoints"))
+    p.add_argument("--run-name", help="stage-1 run name (default: vqvae2_L<levels>_ssim<weight>)")
+    p.add_argument("--vqvae-run", help="stage-1 run directory for the encode, top and bottom "
+                                       "stages (default: <checkpoint-dir>/<default run name>)")
     p.add_argument("--resume", action="store_true",
-                   help="continue from <run_dir>/last.pt if it exists")
+                   help="continue from the stage's last.pt if it exists")
     p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--limit-batches", type=int, help="cap batches per epoch, for smoke tests")
     return p.parse_args()
@@ -155,99 +391,15 @@ def main():
         cfg["vqvae"]["levels"] = args.levels
     if args.ssim_loss_weight is not None:
         cfg["vqvae"]["ssim_loss_weight"] = args.ssim_loss_weight
-    if args.epochs is not None:
-        cfg["train"]["epochs"] = args.epochs
-    if args.patience is not None:
-        cfg["train"]["patience"] = args.patience
-
-    run_name = args.run_name or (f"vqvae2_L{cfg['vqvae']['levels']}"
-                                 f"_ssim{cfg['vqvae']['ssim_loss_weight']:g}")
-    run_dir = os.path.join(args.checkpoint_dir, run_name)
-    last_path = os.path.join(run_dir, "last.pt")
-    best_path = os.path.join(run_dir, "best.pt")
-
-    state = None
-    if os.path.exists(last_path):
-        if not args.resume:
-            raise SystemExit(f"{last_path} already exists. Pass --resume to continue "
-                             "that run, or choose a new --run-name.")
-        state = torch.load(last_path, map_location="cpu", weights_only=True)
-        if state["config"]["vqvae"] != cfg["vqvae"]:
-            print("Resuming with the model config saved in the checkpoint")
-        cfg["vqvae"] = state["config"]["vqvae"]
-    os.makedirs(run_dir, exist_ok=True)
-
-    train_cfg = cfg["train"]
-    epochs, patience = train_cfg["epochs"], train_cfg["patience"]
-    min_delta, ssim_weight = train_cfg["min_delta"], cfg["vqvae"]["ssim_loss_weight"]
-    random.seed(train_cfg["seed"])
-    torch.manual_seed(train_cfg["seed"])
+    args.vqvae_run = args.vqvae_run or os.path.join(args.checkpoint_dir, default_vqvae_run(cfg))
     device = pick_device()
 
-    datasets = build_datasets(args.root or cfg["data"]["root"], cfg["data"]["size"],
-                              cfg["data"]["clip_percentile"])
-    loader_rng = torch.Generator().manual_seed(train_cfg["seed"])
-    loader_kwargs = dict(batch_size=train_cfg["batch_size"], num_workers=args.num_workers,
-                         pin_memory=device.type == "cuda",
-                         persistent_workers=args.num_workers > 0)
-    train_loader = DataLoader(datasets["train"], shuffle=True, generator=loader_rng,
-                              **loader_kwargs)
-    val_loader = DataLoader(datasets["validate"], shuffle=False, **loader_kwargs)
-
-    model = build_model(cfg).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=train_cfg["lr"])
-    levels = model.level_names
-
-    history, best_ssim, stale_epochs, start_epoch = [], float("-inf"), 0, 1
-    if state is not None:
-        model.load_state_dict(state["model"])
-        optimizer.load_state_dict(state["optimizer"])
-        loader_rng.set_state(state["loader_rng"])
-        torch.set_rng_state(state["torch_rng"])
-        history, best_ssim = state["history"], state["best_ssim"]
-        stale_epochs, start_epoch = state["stale_epochs"], state["epoch"] + 1
-        print(f"Resumed {run_name} from epoch {state['epoch']} "
-              f"(best val SSIM {best_ssim:.4f})")
-        if stale_epochs >= patience:
-            print(f"Run already stopped early ({stale_epochs} epochs without improvement)")
-            return
-
-    print(f"Training {run_name} on {device}: {len(datasets['train'])} train / "
-          f"{len(datasets['validate'])} validate slices, levels {levels}, "
-          f"{sum(p.numel() for p in model.parameters()) / 1e6:.2f}M params")
-
-    for epoch in range(start_epoch, epochs + 1):
-        start = time.time()
-        record = {"epoch": epoch}
-        record.update(run_epoch(model, train_loader, device, optimizer, ssim_weight,
-                                args.limit_batches))
-        record.update(run_epoch(model, val_loader, device, limit_batches=args.limit_batches))
-        record["seconds"] = round(time.time() - start, 1)
-        history.append(record)
-
-        improved = record["val_ssim"] > best_ssim + min_delta
-        if improved:
-            best_ssim, stale_epochs = record["val_ssim"], 0
-            save_atomic({"model": model.state_dict(), "config": cfg, "epoch": epoch,
-                         "metrics": record}, best_path)
-        else:
-            stale_epochs += 1
-
-        save_atomic({"model": model.state_dict(), "optimizer": optimizer.state_dict(),
-                     "config": cfg, "epoch": epoch, "history": history,
-                     "best_ssim": best_ssim, "stale_epochs": stale_epochs,
-                     "loader_rng": loader_rng.get_state(),
-                     "torch_rng": torch.get_rng_state()}, last_path)
-        write_history(history, os.path.join(run_dir, "history.csv"))
-        plot_history(history, os.path.join(run_dir, "loss_curves.png"), levels)
-        print(format_epoch(record, epochs, levels, improved))
-
-        if stale_epochs >= patience:
-            print(f"Early stopping: val SSIM has not improved by {min_delta} "
-                  f"for {patience} epochs (best {best_ssim:.4f})")
-            break
-
-    print(f"Done. Best val SSIM {best_ssim:.4f}; checkpoints in {run_dir}")
+    if args.stage == "vqvae":
+        train_vqvae(args, cfg, device)
+    elif args.stage == "encode":
+        encode_codes(args.vqvae_run, args.root, device)
+    else:
+        train_prior(args.stage, args, cfg, device)
 
 
 if __name__ == "__main__":
