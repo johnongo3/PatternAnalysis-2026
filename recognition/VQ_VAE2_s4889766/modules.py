@@ -1,11 +1,17 @@
 """
 VQ-VAE-2 (Razavi et al., 2019) for single-channel 256 x 128 MRI slices.
 
-The layout follows the paper and rosinality's reference implementation. The
-bottom encoder downsamples 4x (64 x 32 codes) and the top encoder a further 2x
-(32 x 16 codes). The bottom quantiser is conditioned on the decoded top
-latents, and the decoder sees both levels. With levels=1 only the bottom level
-is built, giving a single-level VQ-VAE baseline.
+Stage 1, VQVAE2: the layout follows the paper and rosinality's reference
+implementation. The bottom encoder downsamples 4x (64 x 32 codes) and the top
+encoder a further 2x (32 x 16 codes). The bottom quantiser is conditioned on the
+decoded top latents, and the decoder sees both levels. With levels=1 only the
+bottom level is built, giving a single-level VQ-VAE baseline.
+
+Stage 2, TopPrior and BottomPrior: autoregressive priors over the code maps,
+built from gated PixelCNN layers (van den Oord et al., 2016) with vertical and
+horizontal stacks, so there is no blind spot. The top prior adds causal
+self-attention for global context. The bottom prior is conditioned on the top
+codes through a residual conditioning stack.
 """
 from typing import NamedTuple
 
@@ -254,3 +260,244 @@ class VQVAE2(nn.Module):
             raise ValueError("Top-only reconstruction needs levels=2")
         enc = self.encode(x)
         return self.decode(torch.zeros_like(enc["bottom"].quantized), enc["top"].quantized)
+
+
+def _gate(x: torch.Tensor) -> torch.Tensor:
+    """Gated activation tanh(a) * sigmoid(b), splitting channels in half."""
+    a, b = x.chunk(2, dim=1)
+    return torch.tanh(a) * torch.sigmoid(b)
+
+
+def _shift_down(x: torch.Tensor) -> torch.Tensor:
+    """Shift a feature map down one row, so row i only carries rows above it."""
+    return F.pad(x, (0, 0, 1, 0))[:, :, :-1]
+
+
+class MaskedConv2d(nn.Conv2d):
+    """
+    Convolution whose kernel is multiplied by a fixed causal mask.
+
+    mask="vertical": k x k kernel seeing the current row and the rows above
+    mask="A": 1 x k kernel seeing only positions to the left (first layer)
+    mask="B": 1 x k kernel seeing positions to the left and the current one
+    """
+
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, mask: str):
+        if kernel_size % 2 == 0:
+            raise ValueError(f"kernel_size must be odd, got {kernel_size}")
+        k = kernel_size
+        if mask == "vertical":
+            super().__init__(in_channels, out_channels, (k, k), padding=k // 2)
+            m = torch.zeros(k, k)
+            m[: k // 2 + 1] = 1
+        elif mask in ("A", "B"):
+            super().__init__(in_channels, out_channels, (1, k), padding=(0, k // 2))
+            m = torch.zeros(1, k)
+            m[:, : k // 2 + (mask == "B")] = 1
+        else:
+            raise ValueError(f"mask must be 'vertical', 'A' or 'B', got {mask!r}")
+        self.register_buffer("mask", m)
+
+    def forward(self, x):
+        return F.conv2d(x, self.weight * self.mask, self.bias, self.stride, self.padding)
+
+
+class GatedResBlock(nn.Module):
+    """
+    One gated PixelCNN layer. The vertical stack sees every row above, and is
+    shifted down a row before feeding the horizontal stack, which sees the
+    current row to the left. Together they cover all earlier positions in
+    raster order. Optional conditioning (B, cond_channels, H, W) is projected
+    and added to both stacks.
+
+    mask_type: "A" for the first layer (excludes the current code), else "B"
+    residual: add the horizontal input back; must be False for the first layer,
+        whose input still contains the current code
+    """
+
+    def __init__(self, channels: int, kernel_size: int, mask_type: str, residual: bool,
+                 dropout: float = 0.0, cond_channels: int = 0):
+        super().__init__()
+        self.residual = residual
+        self.v_conv = MaskedConv2d(channels, 2 * channels, kernel_size, "vertical")
+        self.h_conv = MaskedConv2d(channels, 2 * channels, kernel_size, mask_type)
+        self.v_to_h = nn.Conv2d(2 * channels, 2 * channels, 1)
+        self.h_out = nn.Conv2d(channels, channels, 1)
+        self.dropout = nn.Dropout(dropout)
+        self.cond = nn.Conv2d(cond_channels, 2 * channels, 1) if cond_channels else None
+
+    def forward(self, v, h, cond=None):
+        v_pre = self.v_conv(v)
+        h_pre = self.h_conv(h) + self.v_to_h(_shift_down(v_pre))
+        if self.cond is not None:
+            c = self.cond(cond)
+            v_pre, h_pre = v_pre + c, h_pre + c
+        h_new = self.h_out(self.dropout(_gate(h_pre)))
+        return _gate(v_pre), (h + h_new if self.residual else h_new)
+
+
+class CausalAttention(nn.Module):
+    """
+    Multi-head self-attention over a feature map in raster order, where each
+    position attends to itself and earlier positions only. Applied to the
+    horizontal stack, whose features at a position already exclude that code.
+
+    Normalisation is LayerNorm over channels at each position; normalising
+    across positions (BatchNorm, GroupNorm) would leak future codes.
+    """
+
+    def __init__(self, channels: int, heads: int, dropout: float = 0.0):
+        super().__init__()
+        if channels % heads:
+            raise ValueError(f"channels ({channels}) must be divisible by heads ({heads})")
+        self.heads = heads
+        self.dropout = dropout
+        self.norm = nn.LayerNorm(channels)
+        self.qkv = nn.Linear(channels, 3 * channels)
+        self.proj = nn.Linear(channels, channels)
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+        seq = x.flatten(2).transpose(1, 2) # (B, H*W, C), raster order
+        q, k, v = (self.qkv(self.norm(seq))
+                   .view(b, h * w, 3, self.heads, c // self.heads)
+                   .permute(2, 0, 3, 1, 4))
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=True,
+                                             dropout_p=self.dropout if self.training else 0.0)
+        out = self.proj(out.transpose(1, 2).reshape(b, h * w, c))
+        return x + out.transpose(1, 2).view(b, c, h, w)
+
+
+class ConditioningStack(nn.Module):
+    """
+    Turns top codes into a feature map on the bottom grid: embedding, residual
+    blocks at 32 x 16, then a 2x transposed convolution to 64 x 32. It need not
+    be causal, since the whole top map is known before the bottom is generated.
+    """
+
+    def __init__(self, codebook_size: int, channels: int, n_res_blocks: int):
+        super().__init__()
+        self.embed = nn.Embedding(codebook_size, channels)
+        self.net = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=1),
+            *[ResBlock(channels, channels) for _ in range(n_res_blocks)],
+            nn.ReLU(),
+            nn.ConvTranspose2d(channels, channels, 4, stride=2, padding=1),
+        )
+
+    def forward(self, top_codes: torch.Tensor) -> torch.Tensor:
+        return self.net(self.embed(top_codes).permute(0, 3, 1, 2))
+
+
+class PixelCNNPrior(nn.Module):
+    """
+    Gated PixelCNN over a (H, W) map of codebook indices, predicting each code
+    from the ones before it in raster order. Shared by TopPrior and BottomPrior.
+
+    codebook_size: number of codes K (the output classes)
+    shape: (H, W) of the code map
+    attention_every: add a CausalAttention block after every this many gated
+        layers; 0 disables attention
+    cond_channels: channels of the conditioning map passed to every layer, or 0
+    """
+
+    def __init__(self, codebook_size: int, shape: tuple[int, int], channels: int = 256,
+                 layers: int = 12, kernel_size: int = 5, attention_every: int = 0,
+                 heads: int = 4, dropout: float = 0.0, cond_channels: int = 0):
+        super().__init__()
+        self.codebook_size = codebook_size
+        self.shape = tuple(shape)
+        self.embed = nn.Embedding(codebook_size, channels)
+        self.pos = nn.Parameter(torch.randn(1, channels, *shape) * 0.02)
+        self.blocks = nn.ModuleList(
+            GatedResBlock(channels, kernel_size, "A" if i == 0 else "B", residual=i > 0,
+                          dropout=dropout, cond_channels=cond_channels)
+            for i in range(layers))
+        self.attention = nn.ModuleDict({
+            str(i): CausalAttention(channels, heads, dropout)
+            for i in range(layers) if attention_every and (i + 1) % attention_every == 0})
+        self.head = nn.Sequential(nn.ReLU(), nn.Conv2d(channels, channels, 1),
+                                  nn.ReLU(), nn.Conv2d(channels, codebook_size, 1))
+
+    def logits(self, codes: torch.Tensor, cond: torch.Tensor | None = None) -> torch.Tensor:
+        """
+        (B, H', W) codes to (B, K, H', W) logits. H' may be fewer rows than the
+        full map: every layer is causal, so the first rows do not depend on later ones.
+        """
+        x = self.embed(codes).permute(0, 3, 1, 2) + self.pos[:, :, :codes.shape[1]]
+        v = h = x
+        for i, block in enumerate(self.blocks):
+            v, h = block(v, h, cond)
+            if str(i) in self.attention:
+                h = self.attention[str(i)](h)
+        return self.head(h)
+
+    @torch.no_grad()
+    def _sample(self, n: int, temperature: float, generator: torch.Generator | None,
+                cond: torch.Tensor | None) -> torch.Tensor:
+        """Sample n code maps one position at a time, in raster order."""
+        if self.training:
+            raise RuntimeError("Call .eval() before sampling, so dropout is off")
+        rows, cols = self.shape
+        codes = torch.zeros(n, rows, cols, dtype=torch.long, device=self.pos.device)
+        for i in range(rows):
+            # rows below i cannot affect row i, so only run the network on rows 0..i
+            row_cond = cond[:, :, :i + 1] if cond is not None else None
+            for j in range(cols):
+                logits = self.logits(codes[:, :i + 1], row_cond)[:, :, i, j] / temperature
+                codes[:, i, j] = torch.multinomial(F.softmax(logits, dim=1), 1,
+                                                   generator=generator).squeeze(1)
+        return codes
+
+
+class TopPrior(PixelCNNPrior):
+    """Unconditional prior over the top code map, with causal attention."""
+
+    def forward(self, codes: torch.Tensor) -> torch.Tensor:
+        return self.logits(codes)
+
+    def sample(self, n: int, temperature: float = 1.0,
+               generator: torch.Generator | None = None) -> torch.Tensor:
+        return self._sample(n, temperature, generator, None)
+
+
+class BottomPrior(PixelCNNPrior):
+    """
+    Prior over the bottom code map, conditioned on the top codes. Trained with
+    teacher forcing on the true top codes; at sampling time the top codes come
+    from TopPrior.
+    """
+
+    def __init__(self, codebook_size: int, shape: tuple[int, int], channels: int = 256,
+                 layers: int = 10, kernel_size: int = 5, attention_every: int = 0,
+                 heads: int = 4, dropout: float = 0.0, cond_res_blocks: int = 8):
+        super().__init__(codebook_size, shape, channels, layers, kernel_size,
+                         attention_every, heads, dropout, cond_channels=channels)
+        self.condition = ConditioningStack(codebook_size, channels, cond_res_blocks)
+
+    def forward(self, codes: torch.Tensor, top_codes: torch.Tensor) -> torch.Tensor:
+        return self.logits(codes, self.condition(top_codes))
+
+    def sample(self, top_codes: torch.Tensor, temperature: float = 1.0,
+               generator: torch.Generator | None = None) -> torch.Tensor:
+        return self._sample(len(top_codes), temperature, generator, self.condition(top_codes))
+
+
+def build_vqvae(cfg: dict) -> VQVAE2:
+    """Build a VQVAE2 from the vqvae section of a config."""
+    kwargs = {k: v for k, v in cfg["vqvae"].items() if k != "ssim_loss_weight"}
+    return VQVAE2(in_channels=1, **kwargs)
+
+
+def build_prior(level: str, cfg: dict) -> PixelCNNPrior:
+    """
+    Build the top or bottom prior from the prior_<level> section of a config.
+    The code map shape follows from the image size: /8 for top, /4 for bottom.
+    """
+    rows, cols = cfg["data"]["size"]
+    k = cfg["vqvae"]["codebook_size"]
+    if level == "top":
+        return TopPrior(k, (rows // 8, cols // 8), **cfg["prior_top"])
+    if level == "bottom":
+        return BottomPrior(k, (rows // 4, cols // 4), **cfg["prior_bottom"])
+    raise ValueError(f"level must be 'top' or 'bottom', got {level!r}")
