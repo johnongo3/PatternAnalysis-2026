@@ -24,7 +24,7 @@ from dataclasses import dataclass
 import nibabel as nib
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 SPLITS = ("train", "validate", "test")
@@ -197,6 +197,41 @@ def build_datasets(root: str, size=(256, 128), clip_percentile: float = 99.5,
                 for split in SPLITS}
     check_no_patient_leakage(datasets)
     return datasets
+
+
+@torch.no_grad()
+def encode_dataset(model, dataset: Dataset, device: torch.device,
+                   batch_size: int = 64) -> dict[str, torch.Tensor]:
+    """
+    Encode every slice with a frozen VQ-VAE-2, in dataset order. Returns the
+    code map of each level (e.g. "top": (N, 32, 16), "bottom": (N, 64, 32)) as
+    int16, which holds any codebook of up to 32768 codes.
+    """
+    model.eval()
+    codes = {level: [] for level in model.level_names}
+    for x in tqdm(DataLoader(dataset, batch_size=batch_size), desc="Encoding", disable=None):
+        for level, out in model.encode(x.to(device)).items():
+            codes[level].append(out.codes.to(torch.int16).cpu())
+    return {level: torch.cat(chunks) for level, chunks in codes.items()}
+
+
+class CodeDataset(Dataset):
+    """
+    Saved code maps of one split, as written by train.py --stage encode.
+    Returns (top, bottom) code maps as long tensors. vqvae_epoch records which
+    stage-1 checkpoint made the codes.
+    """
+
+    def __init__(self, path: str):
+        saved = torch.load(path, map_location="cpu", weights_only=True)
+        self.top, self.bottom, self.names = saved["top"], saved["bottom"], saved["names"]
+        self.vqvae_epoch = saved["vqvae_epoch"]
+
+    def __len__(self) -> int:
+        return len(self.bottom)
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.top[idx].long(), self.bottom[idx].long()
 
 
 if __name__ == "__main__":
