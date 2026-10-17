@@ -20,18 +20,30 @@ train:
   patience: 10           # stop after this many epochs without a val SSIM gain
   min_delta: 1.0e-4      # smallest val SSIM gain that counts as improvement
   seed: 0
-prior_top:
+prior_top:               # 32 x 16 top codes
   channels: 256
-  layers: 12
-  attention_every: 4
+  layers: 12             # gated PixelCNN layers
+  kernel_size: 5
+  attention_every: 4     # causal attention after every 4th layer
   heads: 4
   dropout: 0.3
-prior_bottom:
+prior_bottom:            # 64 x 32 bottom codes, conditioned on the top codes
   channels: 256
   layers: 10
-  cond_res_blocks: 8
+  kernel_size: 5
+  attention_every: 0     # 0 = no attention (2048 positions; memory)
+  heads: 4
+  cond_res_blocks: 8     # residual blocks in the top-code conditioning stack
   dropout: 0.3
+train_prior:             # shared by both priors
+  batch_size: 32
+  lr: 3.0e-4
+  epochs: 100            # early-stop on val NLL
+  patience: 10
+  min_delta: 1.0e-3      # bits per code
+  seed: 0
 sample:
   temperatures: [0.8, 0.9, 1.0]
-  n_samples: 512
+  n_samples: 512         # per temperature
+  batch_size: 64
   seed: 0
