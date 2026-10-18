@@ -13,6 +13,10 @@ Usage:
     python train.py --stage top    [--vqvae-run checkpoints/vqvae2_L2_ssim0] [--resume]
     python train.py --stage bottom [--vqvae-run checkpoints/vqvae2_L2_ssim0] [--resume]
 
+For the single-level baseline, encode as above and train its one unconditional
+prior (prior_single in the config) with:
+    python train.py --stage bottom --vqvae-run checkpoints/vqvae2_L1_ssim0 [--resume]
+
 Every training stage runs through the same loop (fit): train and validate each
 epoch, log to <run_dir>/history.csv and loss_curves.png, keep best.pt on the
 monitored validation metric (SSIM for stage 1, NLL in bits per code for the
@@ -33,7 +37,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from dataset import SPLITS, CodeDataset, build_datasets, encode_dataset
-from modules import build_prior, build_vqvae
+from modules import BottomPrior, build_prior, build_vqvae, prior_section
 from utils import (codes_dir, load_checkpoint, load_config, load_vqvae, perplexity_from_counts,
                    pick_device, plot_prior_history, plot_vqvae_history, prior_dir, psnr,
                    save_atomic, ssim)
@@ -102,9 +106,10 @@ def vqvae_epoch(model, loader, device, optimizer=None, ssim_weight=0.0, limit_ba
 
 def prior_epoch(model, level, loader, device, optimizer=None, limit_batches=None):
     """
-    One pass of a prior over (top, bottom) code batches. The top prior models the
-    top codes; the bottom prior models the bottom codes given the true top codes
-    (teacher forcing). Returns NLL in bits per code and next-code accuracy.
+    One pass of a prior over batches of code maps, modelling the codes of
+    `level`. The bottom prior of a two-level model is conditioned on the true
+    top codes (teacher forcing); the top prior and the single-level baseline's
+    prior are unconditional. Returns NLL in bits per code and next-code accuracy.
     """
     training = optimizer is not None
     model.train(training)
@@ -112,14 +117,15 @@ def prior_epoch(model, level, loader, device, optimizer=None, limit_batches=None
     nll_sum, correct, n_codes = 0.0, 0, 0
 
     with torch.set_grad_enabled(training):
-        for i, (top, bottom) in enumerate(tqdm(loader, desc=prefix, leave=False, disable=None)):
+        for i, batch in enumerate(tqdm(loader, desc=prefix, leave=False, disable=None)):
             if limit_batches is not None and i >= limit_batches:
                 break
-            top, bottom = top.to(device, non_blocking=True), bottom.to(device, non_blocking=True)
-            if level == "top":
-                target, logits = top, model(top)
+            codes = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+            target = codes[level]
+            if isinstance(model, BottomPrior):
+                logits = model(target, codes["top"])
             else:
-                target, logits = bottom, model(bottom, top)
+                logits = model(target)
             loss = F.cross_entropy(logits, target)
 
             if training:
@@ -302,8 +308,6 @@ def train_vqvae(args, cfg: dict, device: torch.device):
 def encode_codes(vqvae_run: str, root: str | None, device: torch.device):
     """Encode every split with the frozen stage-1 model into <vqvae_run>/codes/<split>.pt."""
     model, ckpt = load_vqvae(vqvae_run, device)
-    if model.levels != 2:
-        raise SystemExit("The priors need a two-level stage-1 model (vqvae.levels: 2)")
     cfg = ckpt["config"]
     datasets = build_datasets(root or cfg["data"]["root"], cfg["data"]["size"],
                               cfg["data"]["clip_percentile"])
@@ -313,9 +317,8 @@ def encode_codes(vqvae_run: str, root: str | None, device: torch.device):
         save_atomic({**codes, "names": [os.path.basename(r.path) for r in ds.records],
                      "vqvae_epoch": ckpt["epoch"]},
                     os.path.join(codes_dir(vqvae_run), f"{split}.pt"))
-        print(f"{split:>8}: {len(ds)} slices -> top {tuple(codes['top'].shape[1:])}, "
-              f"bottom {tuple(codes['bottom'].shape[1:])} codes "
-              f"(stage-1 epoch {ckpt['epoch']})")
+        shapes = ", ".join(f"{level} {tuple(c.shape[1:])}" for level, c in codes.items())
+        print(f"{split:>8}: {len(ds)} slices -> {shapes} codes (stage-1 epoch {ckpt['epoch']})")
 
 
 def load_code_datasets(vqvae_run: str, root: str | None,
@@ -336,12 +339,13 @@ def load_code_datasets(vqvae_run: str, root: str | None,
 
 def train_prior(level: str, args, cfg: dict, device: torch.device):
     vqvae_cfg = load_checkpoint(args.vqvae_run)["config"]
-    if vqvae_cfg["vqvae"]["levels"] != 2:
-        raise SystemExit("The priors need a two-level stage-1 model (vqvae.levels: 2)")
+    if vqvae_cfg["vqvae"]["levels"] == 1 and level != "bottom":
+        raise SystemExit("A single-level stage-1 model only has bottom codes; "
+                         "train its prior with --stage bottom")
     # stage-1 settings come from its checkpoint, prior settings from the config file
     cfg["data"], cfg["vqvae"] = vqvae_cfg["data"], vqvae_cfg["vqvae"]
     run_dir = prior_dir(args.vqvae_run, level)
-    use_saved_architecture(run_dir, cfg, f"prior_{level}", args.resume)
+    use_saved_architecture(run_dir, cfg, prior_section(level, cfg), args.resume)
     train_cfg = stage_train_config(cfg, "train_prior", args)
     seed_everything(train_cfg["seed"])
 

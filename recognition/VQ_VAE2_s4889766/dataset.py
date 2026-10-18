@@ -218,20 +218,21 @@ def encode_dataset(model, dataset: Dataset, device: torch.device,
 class CodeDataset(Dataset):
     """
     Saved code maps of one split, as written by train.py --stage encode.
-    Returns (top, bottom) code maps as long tensors. vqvae_epoch records which
-    stage-1 checkpoint made the codes.
+    Returns a dict of code maps per level as long tensors: "top" and "bottom"
+    for a two-level model, only "bottom" for the single-level baseline.
+    vqvae_epoch records which stage-1 checkpoint made the codes.
     """
 
     def __init__(self, path: str):
         saved = torch.load(path, map_location="cpu", weights_only=True)
-        self.top, self.bottom, self.names = saved["top"], saved["bottom"], saved["names"]
-        self.vqvae_epoch = saved["vqvae_epoch"]
+        self.codes = {level: saved[level] for level in ("top", "bottom") if level in saved}
+        self.names, self.vqvae_epoch = saved["names"], saved["vqvae_epoch"]
 
     def __len__(self) -> int:
-        return len(self.bottom)
+        return len(self.codes["bottom"])
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.top[idx].long(), self.bottom[idx].long()
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        return {level: codes[idx].long() for level, codes in self.codes.items()}
 
 
 if __name__ == "__main__":

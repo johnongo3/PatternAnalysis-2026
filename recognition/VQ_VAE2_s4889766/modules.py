@@ -451,7 +451,10 @@ class PixelCNNPrior(nn.Module):
 
 
 class TopPrior(PixelCNNPrior):
-    """Unconditional prior over the top code map, with causal attention."""
+    """
+    Unconditional prior with causal attention: over the top codes of the
+    two-level model, or over the only (bottom) codes of the single-level baseline.
+    """
 
     def forward(self, codes: torch.Tensor) -> torch.Tensor:
         return self.logits(codes)
@@ -489,13 +492,27 @@ def build_vqvae(cfg: dict) -> VQVAE2:
     return VQVAE2(in_channels=1, **kwargs)
 
 
+def prior_section(level: str, cfg: dict) -> str:
+    """
+    The config section holding a prior's architecture: prior_top and
+    prior_bottom for a two-level model, prior_single for the single-level baseline.
+    """
+    return "prior_single" if cfg["vqvae"]["levels"] == 1 else f"prior_{level}"
+
+
 def build_prior(level: str, cfg: dict) -> PixelCNNPrior:
     """
-    Build the top or bottom prior from the prior_<level> section of a config.
-    The code map shape follows from the image size: /8 for top, /4 for bottom.
+    Build a prior from a config. A two-level model has a top prior and a bottom
+    prior conditioned on the top codes. The single-level baseline has one
+    unconditional prior over its bottom codes. The code map shape follows from
+    the image size: /8 for top, /4 for bottom.
     """
     rows, cols = cfg["data"]["size"]
     k = cfg["vqvae"]["codebook_size"]
+    if cfg["vqvae"]["levels"] == 1:
+        if level != "bottom":
+            raise ValueError("A single-level model only has bottom codes")
+        return TopPrior(k, (rows // 4, cols // 4), **cfg["prior_single"])
     if level == "top":
         return TopPrior(k, (rows // 8, cols // 8), **cfg["prior_top"])
     if level == "bottom":

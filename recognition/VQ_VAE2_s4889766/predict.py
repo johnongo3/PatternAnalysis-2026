@@ -12,13 +12,15 @@ and to --out:
     loss_curves_<run>.png      stage-1 training curves
     reconstructions_<run>.png  test slices: original, top only, full, |error|
 
-Sampling (--sample) needs the priors from train.py --stage top and --stage
-bottom. For each temperature it samples top codes from the top prior, then
-bottom codes from the bottom prior given those, then decodes them with the
-stage-1 decoder, in batches from a fixed seed. Images and codes go to
+Sampling (--sample) needs the run's priors from train.py: --stage top and
+--stage bottom for a two-level run, --stage bottom alone for the single-level
+baseline. For each temperature it samples top codes from the top prior, then
+bottom codes from the bottom prior given those (or the baseline's codes from
+its one prior), then decodes them with the stage-1 decoder, in batches from a
+fixed seed. Images and codes go to
 RUN_DIR/samples/samples_t<T>.pt, and to --out:
     samples_<run>.png          the first --n samples at each temperature
-    prior_nll_<run>.png        train and validation bits per code of both priors
+    prior_nll_<run>.png        train and validation bits per code of each prior
 """
 import argparse
 import json
@@ -62,22 +64,26 @@ def evaluate(model, loader, device) -> dict:
 
 
 @torch.no_grad()
-def sample_images(vqvae, top_prior, bottom_prior, n: int, temperature: float, seed: int,
+def sample_images(vqvae, priors: dict, n: int, temperature: float, seed: int,
                   batch_size: int, device: torch.device) -> dict[str, torch.Tensor]:
     """
-    Generate n slices: top prior, then bottom prior given the top codes, then the
-    stage-1 decoder. One generator seeded once drives every batch, so a given
-    (seed, batch_size) always gives the same samples.
+    Generate n slices from the priors, then decode them with the stage-1 decoder.
+    Two-level: the top prior, then the bottom prior given the top codes.
+    Single-level: the one prior over the bottom codes. One generator seeded once
+    drives every batch, so a given (seed, batch_size) always gives the same samples.
     """
     generator = torch.Generator(device=device).manual_seed(seed)
-    out = {"images": [], "top": [], "bottom": []}
+    out = {"images": [], **{level: [] for level in priors}}
     for start in range(0, n, batch_size):
         b = min(batch_size, n - start)
-        top = top_prior.sample(b, temperature, generator)
-        bottom = bottom_prior.sample(top, temperature, generator)
-        out["images"].append(vqvae.decode_codes(bottom, top).clamp(0, 1).cpu())
-        out["top"].append(top.to(torch.int16).cpu())
-        out["bottom"].append(bottom.to(torch.int16).cpu())
+        if "top" in priors:
+            top = priors["top"].sample(b, temperature, generator)
+            codes = {"top": top, "bottom": priors["bottom"].sample(top, temperature, generator)}
+        else:
+            codes = {"bottom": priors["bottom"].sample(b, temperature, generator)}
+        out["images"].append(vqvae.decode_codes(codes["bottom"], codes.get("top")).clamp(0, 1).cpu())
+        for level, c in codes.items():
+            out[level].append(c.to(torch.int16).cpu())
         print(f"  T={temperature:g}: {start + b}/{n} samples")
     return {k: torch.cat(v) for k, v in out.items()}
 
@@ -122,31 +128,31 @@ def reconstruct(args, device: torch.device):
 
 def sample(args, device: torch.device):
     vqvae, _ = load_vqvae(args.run_dir, device)
-    top_prior, top_ckpt = load_prior(args.run_dir, "top", device)
-    bottom_prior, bottom_ckpt = load_prior(args.run_dir, "bottom", device)
-    sample_cfg = bottom_ckpt["config"]["sample"]
+    priors, ckpts = {}, {}
+    for level in vqvae.level_names:
+        priors[level], ckpts[level] = load_prior(args.run_dir, level, device)
+        print(f"Loaded {level} prior from epoch {ckpts[level]['epoch']} "
+              f"(val {ckpts[level]['metrics']['val_bits_per_code']:.4f} bits/code)")
+    sample_cfg = ckpts["bottom"]["config"]["sample"]
     temperatures = args.temperatures or sample_cfg["temperatures"]
     n = args.n_samples or sample_cfg["n_samples"]
     run_name = os.path.basename(os.path.normpath(args.run_dir))
-    for level, ckpt in [("top", top_ckpt), ("bottom", bottom_ckpt)]:
-        print(f"Loaded {level} prior from epoch {ckpt['epoch']} "
-              f"(val {ckpt['metrics']['val_bits_per_code']:.4f} bits/code)")
 
     samples_dir = os.path.join(args.run_dir, "samples")
     os.makedirs(samples_dir, exist_ok=True)
     os.makedirs(args.out, exist_ok=True)
     previews = {}
     for t in temperatures:
-        out = sample_images(vqvae, top_prior, bottom_prior, n, t, sample_cfg["seed"],
+        out = sample_images(vqvae, priors, n, t, sample_cfg["seed"],
                             sample_cfg["batch_size"], device)
-        save_atomic({"images": out["images"].half(), "top": out["top"],
-                     "bottom": out["bottom"], "temperature": t, "seed": sample_cfg["seed"]},
+        save_atomic({"images": out["images"].half(), **{lv: out[lv] for lv in priors},
+                     "temperature": t, "seed": sample_cfg["seed"]},
                     os.path.join(samples_dir, f"samples_t{t:g}.pt"))
         previews[t] = out["images"][:args.n]
 
     plot_samples(previews, os.path.join(args.out, f"samples_{run_name}.png"))
     histories = {level: load_checkpoint(prior_dir(args.run_dir, level), "last.pt")["history"]
-                 for level in ("top", "bottom")}
+                 for level in priors}
     plot_prior_history(histories, os.path.join(args.out, f"prior_nll_{run_name}.png"))
     print(f"Saved {n} samples per temperature to {samples_dir} and figures to {args.out}")
 

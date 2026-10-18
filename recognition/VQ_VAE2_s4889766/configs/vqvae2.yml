@@ -35,7 +35,14 @@ prior_bottom:            # 64 x 32 bottom codes, conditioned on the top codes
   heads: 4
   cond_res_blocks: 8     # residual blocks in the top-code conditioning stack
   dropout: 0.3
-train_prior:             # shared by both priors
+prior_single:            # single-level baseline: one unconditional prior over
+  channels: 256          # its 64 x 32 codes, mirroring prior_top so it also
+  layers: 12             # has global context through attention
+  kernel_size: 5
+  attention_every: 4
+  heads: 4
+  dropout: 0.3
+train_prior:             # shared by every prior
   batch_size: 32
   lr: 3.0e-4
   epochs: 100            # early-stop on val NLL
