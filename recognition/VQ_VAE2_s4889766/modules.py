@@ -251,6 +251,35 @@ class VQVAE2(nn.Module):
         }
 
     @torch.no_grad()
+    def interpolate(self, x_a: torch.Tensor, x_b: torch.Tensor,
+                    alphas: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """
+        Decode blends of two (1, C, H, W) inputs. At each level the encoder
+        outputs before quantisation are mixed, (1 - a) * z_a + a * z_b, then
+        quantised and decoded. Each input's bottom encoder output is computed
+        with its own top latents, as in encode(). Returns the (len(alphas), C,
+        H, W) frames and the codes of each level.
+        """
+        if self.training:
+            raise RuntimeError("Call .eval() before interpolating, so the codebook stays fixed")
+        x = torch.cat([x_a, x_b])
+        alphas = alphas.to(x).view(-1, 1, 1, 1)
+
+        def blend(z):
+            return (1 - alphas) * z[:1] + alphas * z[1:]
+
+        h_b = self.enc_b(x)
+        codes, quant_t = {}, None
+        if self.levels == 2:
+            z_t = self.pre_quant_t(self.enc_t(h_b))
+            top = self.quant_t(blend(z_t))
+            quant_t, codes["top"] = top.quantized, top.codes
+            h_b = torch.cat([self.dec_t(self.quant_t(z_t).quantized), h_b], dim=1)
+        bottom = self.quant_b(blend(self.pre_quant_b(h_b)))
+        codes["bottom"] = bottom.codes
+        return self.decode(bottom.quantized, quant_t), codes
+
+    @torch.no_grad()
     def reconstruct_top_only(self, x: torch.Tensor) -> torch.Tensor:
         """
         Decode with the bottom latents zeroed, to show what the top level alone
