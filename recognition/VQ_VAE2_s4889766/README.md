@@ -270,7 +270,7 @@ Smoothness is measured as the change between consecutive frames, 1 − SSIM. A j
 
 <img src="assets/results/interpolation_vqvae2.png" width="100%">
 
-*VQ-VAE-2 interpolations between four pairs of test slices, labelled by the two patients and the slice index, with the blend weight $a$ above each column.*
+*VQ-VAE-2 interpolations between four pairs of test slices, labelled by the two patients and the slice index, with the blend weight* $a$ *above each column.*
 
 <img src="assets/results/interpolation_baseline.png" width="100%">
 
@@ -348,7 +348,7 @@ Under a shared temperature, the setting where the two-level model is most realis
 
 <img src="assets/results/nn_pairs_t0.8_baseline.png" width="100%">
 
-*The six samples closest to the training set at $T = 0.8$ (top row of each figure), above their nearest training slice (bottom row). The first figure is VQ-VAE-2 and the second is the baseline.*
+*The six samples closest to the training set at* $T = 0.8$ *(top row of each figure), above their nearest training slice (bottom row). The first figure is VQ-VAE-2 and the second is the baseline.*
 
 - **None is a copy.** The flagged samples share their neighbour's layout, such as the size and position of the bladder and the pelvic outline, but not its detail.
   - Their SSIM is 0.47–0.49. The decoder's reconstruction of a slice scores 0.94 against the original, which is roughly what a copy would score.
@@ -382,7 +382,7 @@ The first sweep used the SSIM-loss model, with $T_\text{top}$ and $T_\text{botto
 
 <img src="assets/results/samples_separate.png" width="100%">
 
-*Uncurated samples for each setting of the first sweep: the first six of 512. Rows with the same $T_\text{top}$ share their top codes, so each column keeps its overall layout across those rows and only the texture changes.*
+*Uncurated samples for each setting of the first sweep: the first six of 512. Rows with the same* $T_\text{top}$ *share their top codes, so each column keeps its overall layout across those rows and only the texture changes.*
 
 ### 6.6 Extending the separate temperatures
 The second sweep took $T_\text{top}$ up to 1.0 and 1.1 and $T_\text{bottom}$ down to 0.6 and 0.5. It reused the samples already drawn at 0.9/0.7, so that setting appears in both tables below, which use the same format as before.
@@ -451,7 +451,7 @@ The audits above look at the samples closest to the training set. The autopsy lo
 
 <img src="assets/results/autopsy_t1.1_0.5.png" width="100%">
 
-*The four least like any training slice. From left to right: the sample, the same top codes at $T_\text{bottom} = 0.6$ and $0.7$, the nearest training slice, and the absolute difference between the sample and that slice. Each row is labelled with the nearest slice's patient, week and slice number, and its SSIM.*
+*The four least like any training slice. From left to right: the sample, the same top codes at* $T_\text{bottom} = 0.6$ *and 0.7, the nearest training slice, and the absolute difference between the sample and that slice. Each row is labelled with the nearest slice's patient, week and slice number, and its SSIM.*
 
 - All 16 are visibly broken: the body is washed out to near-white, and the organs are replaced by dark streaks and blotches. The femoral heads appear as distorted rings or not at all. Their nearest-train SSIM (0.14–0.20) is far below the test patients' typical 0.32. Ranking by SSIM could in principle pick plausible new slices instead, but here it picked genuine failures.
 - **The samples are too bright.** Every slice is scaled to [0, 1], and the brightest of the 11,460 training slices has a mean intensity of 0.38.
