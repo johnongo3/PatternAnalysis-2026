@@ -12,7 +12,7 @@ Usage, where RUN is a stage-1 run directory such as checkpoints/vqvae2_L2_ssim0:
     python predict.py interpolate RUN   latent interpolations between test slices
     python predict.py all RUN           the five tasks above, in order
     python predict.py autopsy RUN       flawed samples at one --setting beside their nearest
-                                        training slice and its segmentation mask
+                                        training slice
     python predict.py resources RUN...  parameters, training time, peak VRAM, sampling time
     python predict.py report RUN...     markdown tables comparing runs, from their results
 
@@ -33,11 +33,11 @@ from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 from torch.utils.data import DataLoader
 
-from dataset import MASK_LABELS, CodeDataset, HipMRISlices, build_datasets, load_mask
+from dataset import CodeDataset, HipMRISlices, build_datasets
 from modules import VQVAE2, BottomPrior, build_prior, build_vqvae
 from utils import (code_usage, codes_dir, frechet_distance, inception_features, load_checkpoint,
                    load_prior, load_vqvae, max_code_agreement, nearest_by_ssim, pick_device,
-                   plot_autopsy, plot_candidates, plot_embedding, plot_interpolations,
+                   plot_candidates, plot_embedding, plot_interpolations,
                    plot_nn_histogram, plot_nn_pairs, plot_prior_history, plot_reconstructions,
                    plot_samples, plot_step_changes, plot_vqvae_history, prior_dir, psnr,
                    read_history, save_atomic, ssim, summarise, summarise_by_group, synchronize)
@@ -432,29 +432,18 @@ def parse_setting(setting: str) -> str:
     return temperature_key(dict(zip(("top", "bottom"), values)))
 
 
-def structure_errors(sample: torch.Tensor, neighbour: torch.Tensor,
-                     mask: np.ndarray) -> dict[str, float]:
-    """Mean |sample - neighbour| inside each structure of the neighbour's mask."""
-    error = (sample.float() - neighbour.float()).abs().squeeze().numpy()
-    return {name: float(error[mask == label].mean())
-            for label, name in MASK_LABELS.items() if (mask == label).any()}
-
-
 def autopsy(args, device):
     """
     Failure autopsy at one sampling setting (--setting): flawed samples beside
-    their nearest training slice, with that slice's segmentation mask outlined,
-    so a distorted, misplaced or missing structure shows against real anatomy.
+    their nearest training slice and the difference between them, so a
+    distorted, misplaced or missing structure shows against real anatomy.
     The flawed samples are --indices, or by default the --n least like any
     training slice (lowest nearest-train SSIM), a fixed rule rather than a hand
     pick. A sheet of the 4 * --n lowest helps choose --indices instead.
 
-    A structure's error ratio is the mean |sample - nearest| inside it over the
-    median of the same error across every sample at this setting: 2.0 is twice
-    the usual mismatch there. Settings sharing the top temperature share the
-    top code maps, so the same sample at the other bottom temperatures shows
-    whether a flaw comes from the top prior (it persists) or the bottom prior
-    (it changes).
+    Settings sharing the top temperature share the top code maps, so the same
+    sample at the other bottom temperatures shows whether a flaw comes from the
+    top prior (it persists) or the bottom prior (it changes).
     """
     if not args.setting:
         raise SystemExit("autopsy needs --setting, e.g. --setting 1.1/0.5")
@@ -473,12 +462,6 @@ def autopsy(args, device):
     if not all(0 <= i < len(images) for i in chosen):
         raise SystemExit(f"--indices must be in [0, {len(images)})")
 
-    masks = {int(j): load_mask(train.records[j], cfg["data"]["size"]) for j in nn_idx.unique()}
-    errors = [structure_errors(images[i], train.images[nn_idx[i]], masks[int(nn_idx[i])])
-              for i in range(len(images))]
-    typical = {name: float(np.median([e[name] for e in errors if name in e]))
-               for name in MASK_LABELS.values() if any(name in e for e in errors)}
-
     # other bottom temperatures with this sample's top codes
     idx = torch.tensor(chosen)
     same_top = [k for k in samples if k != key and "top" in s
@@ -488,37 +471,29 @@ def autopsy(args, device):
 
     neighbours = train.images[nn_idx[idx]]
     columns = {f"sample, T={key}": images[idx],
-               **{f"same top codes, T={k}": samples[k]["images"][idx] for k in same_top},
+               **{f"same top codes, T={k}": samples[k]["images"][idx].float() for k in same_top},
                "nearest training slice": neighbours,
-               "sample + nearest's mask": images[idx],
                "|sample - nearest|": (images[idx] - neighbours).abs()}
     records = [train.records[nn_idx[i]] for i in chosen]
     captions = [f"sample {i}\nnearest: case {r.case:03d} wk {r.week} sl {r.slice}\n"
                 f"SSIM {nn_ssim[i]:.3f}" for i, r in zip(chosen, records)]
-    plot_autopsy(columns, np.stack([masks[int(nn_idx[i])] for i in chosen]), captions,
-                 ("nearest training slice", "sample + nearest's mask", "|sample - nearest|"),
-                 figure_path(args, f"autopsy_t{file_tag(key)}"))
+    plot_reconstructions(columns, captions, figure_path(args, f"autopsy_t{file_tag(key)}"))
     pool = order[:4 * args.n]
     plot_candidates(images[pool], [f"sample {i}, SSIM {nn_ssim[i]:.3f}" for i in pool.tolist()],
                     figure_path(args, f"autopsy_candidates_t{file_tag(key)}"))
 
     rows = [{"index": i, "nearest": os.path.basename(r.path), "nearest_ssim": float(nn_ssim[i]),
-             "structures": sorted(errors[i], key=list(MASK_LABELS.values()).index),
-             "error_ratio": {name: e / typical[name] for name, e in errors[i].items()},
              "same_top_ssim": {k: float(p[i]) for k, p in persistence.items()}}
             for i, r in zip(chosen, records)]
     write_results(args.run_dir, f"autopsy_t{file_tag(key)}", {
         "model": model_label(cfg), "temperature": key, "n": len(images),
         "selection": "--indices" if args.indices else "lowest nearest-train SSIM",
-        "typical_structure_error": typical,
         "typical_same_top_ssim": {k: float(p.median()) for k, p in persistence.items()},
         "samples": rows})
 
     print(f"T={key}, {len(images)} samples; nearest-train SSIM median {nn_ssim.median():.3f}")
     for row in rows:
-        ratios = ", ".join(f"{name} {v:.1f}x" for name, v in row["error_ratio"].items())
-        print(f"  sample {row['index']}: nearest {row['nearest']} (SSIM {row['nearest_ssim']:.3f})"
-              f"\n    error vs usual: {ratios}")
+        print(f"  sample {row['index']}: nearest {row['nearest']} (SSIM {row['nearest_ssim']:.3f})")
         if row["same_top_ssim"]:
             print("    SSIM to the same top codes at " + ", ".join(
                 f"T={k}: {v:.2f} (usual {persistence[k].median():.2f})"

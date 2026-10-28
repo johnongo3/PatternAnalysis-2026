@@ -97,31 +97,6 @@ def to_display(image):
     return np.rot90(image)
 
 
-# Segmentation labels of the HipMRI masks.
-MASK_LABELS = {0: "background", 1: "body", 2: "bone", 3: "bladder", 4: "rectum", 5: "prostate"}
-
-
-def mask_path(record: SliceRecord) -> str:
-    """
-    A slice's segmentation mask, in the matching keras_slices_seg_<split> folder:
-    keras_slices_train/case_004_week_0_slice_0.nii.gz has its mask at
-    keras_slices_seg_train/seg_case_004_week_0_slice_0.nii.gz.
-    """
-    folder, name = os.path.split(record.path)
-    seg_folder = os.path.join(os.path.dirname(folder), os.path.basename(folder).replace(
-        "keras_slices_", "keras_slices_seg_"))
-    for candidate in (f"seg_{name}", name):
-        path = os.path.join(seg_folder, candidate)
-        if os.path.exists(path):
-            return path
-    raise FileNotFoundError(f"No mask for {name} in {seg_folder}")
-
-
-def load_mask(record: SliceRecord, size=(256, 128)) -> np.ndarray:
-    """A slice's mask as integer labels (MASK_LABELS), cropped or padded like its image."""
-    return fit_to_size(np.rint(load_slice(mask_path(record))).astype(np.int64), tuple(size))
-
-
 class HipMRISlices(Dataset):
     """
     One split of the HipMRI 2D slices, returning (1, H, W) float tensors in [0, 1].
