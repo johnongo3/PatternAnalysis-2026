@@ -93,7 +93,7 @@ The code needs Python 3.11 or newer, which the pinned numpy and scipy require. T
 ```bash
 conda create -n vqvae2 python=3.12
 conda activate vqvae2
-pip install requirements.txt
+pip install -r requirements.txt
 ```
 
 `requirements.txt` is the full environment frozen on the Rangpur cluster.
@@ -107,21 +107,28 @@ python scripts/check_modules.py       # shape, gradient and codebook checks on r
 python scripts/check_priors.py        # causality and conditioning checks for the priors
 ```
 
-**Training.** The commands are listed in Section 5. Each stage-1 run is saved to `checkpoints/vqvae2_L<levels>_ssim<weight>/`, and its code maps and priors are saved inside it.
-
-**Evaluation.** `predict.py` takes a stage-1 run directory. Each task writes its numbers to `<run>/eval/<task>.json` and its figures to `assets/`.
+**Running on Rangpur.** The Slurm scripts in `jobs/` reproduce every result on one A100 in the `comp3710` partition. Submit them from this folder. Each script activates the conda environment `vqvae2` (set `CONDA_ENV` to use another) and logs to `<job name>_<job id>.out`.
 
 ```bash
-RUN=checkpoints/vqvae2_L2_ssim0.01
-python predict.py all $RUN                     # reconstruct, sample, audit, fid and interpolate
-python predict.py sample $RUN --temperatures 1.1 --bottom-temperatures 0.5
-python predict.py audit $RUN                   # audit and fid score every saved setting
-python predict.py fid $RUN
-python predict.py autopsy $RUN --setting 1.1/0.5
-python predict.py resources checkpoints/vqvae2_L2_ssim0 checkpoints/vqvae2_L1_ssim0
-python predict.py report checkpoints/vqvae2_L2_ssim0 checkpoints/vqvae2_L1_ssim0 $RUN  # assets/results.md
-python scripts/plot_results.py assets/results.md   # comparison plots in assets/results/
+# 1. Train each model: stage 1, then its priors. These jobs run one at a time.
+sbatch jobs/train.sh                          # VQ-VAE-2
+sbatch jobs/train.sh --levels 1               # baseline
+sbatch jobs/train.sh --ssim-loss-weight 0.01  # SSIM-loss variant
+
+# 2. Once training has finished, evaluate each run. Jobs that share a -J name run in turn.
+sbatch -J eval_L2 jobs/evaluate.sh checkpoints/vqvae2_L2_ssim0 --temperatures 0.6 0.7 0.8 0.9 1.0
+sbatch -J eval_L1 jobs/evaluate.sh checkpoints/vqvae2_L1_ssim0 --temperatures 0.6 0.7 0.8 0.9 1.0
+sbatch -J eval_ssim jobs/evaluate.sh checkpoints/vqvae2_L2_ssim0.01
+sbatch -J eval_ssim jobs/evaluate.sh checkpoints/vqvae2_L2_ssim0.01 \
+    --temperatures 0.7 0.8 0.9 --bottom-temperatures 0.7 0.8 0.9
+sbatch -J eval_ssim jobs/evaluate.sh checkpoints/vqvae2_L2_ssim0.01 \
+    --temperatures 0.9 1.0 1.1 --bottom-temperatures 0.5 0.6 0.7
+
+# 3. Once every evaluation has finished: failure autopsy, resource use, results tables and plots.
+sbatch jobs/report.sh
 ```
+
+Each stage-1 run is saved to `checkpoints/vqvae2_L<levels>_ssim<weight>/`, with its code maps and priors inside it (Section 5 explains each training step). `jobs/evaluate.sh` runs `predict.py all` on one run: reconstruct, sample, audit, fid and interpolate. Each task writes its numbers to `<run>/eval/<task>.json` and its figures to `assets/`. Jobs on the same run share a `-J` name so that they never write its results at the same time. Sampling skips settings that are already saved, so an evaluation that hits its 8-hour limit can be resubmitted and carries on. `jobs/report.sh` writes `assets/results.md`, which the comparison plots in `assets/results/` are drawn from. Outside Rangpur, run the `python` lines of each script directly.
 
 
 ## 4. Dataset and Preprocessing
