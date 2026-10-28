@@ -16,22 +16,6 @@ Stage 2 (bottom half) learns which code maps are likely, using gated PixelCNN pr
 ### 1.1 Changes for the HipMRI task
 The paper's main model generates 256×256 ImageNet images (Razavi et al., 2019, Tables 3 and 5). This is how the model built here differs from it:
 
-| | Razavi et al. (ImageNet) | This project |
-|---|---|---|
-| Input | 256×256, colour | 256×128, greyscale |
-| Code maps (top / bottom) | 32×32 / 64×64 | 32×16 / 64×32 |
-| Stage-1 batch size | 128 | 64 |
-| Dead-code restarts | Not used | Used |
-| Reconstruction loss | MSE | MSE, plus an optional SSIM term |
-| Prior width | 512 channels | 256 channels |
-| Top prior | 20 layers, 4 attention layers with 8 heads, 20-layer output stack | 12 layers, 3 attention layers with 4 heads, two 1×1 output layers |
-| Bottom prior | 20 layers, 20-block conditioning stack | 10 layers, 8-block conditioning stack |
-| Prior dropout | 0.1 | 0.3 |
-| Prior batch size | 1024 (top), 512 (bottom) | 32 |
-| Prior conditioning | Class label | None |
-| Quality–diversity control | Classifier-based rejection sampling | Sampling temperature, set separately per prior |
-| Training length | Fixed number of steps | Early stopping on validation |
-
 - **Stage 1 otherwise follows the paper.** It keeps the paper's 128 hidden and 64 residual channels, 2 residual blocks, 512 codes of 64 dimensions, $\beta = 0.25$ and EMA decay 0.99. The single input channel and the 256×128 slices halve both code maps, with the same 4× and 8× downsampling.
 - **The priors are smaller and more regularised.** ImageNet has 1.28 million training images, while HipMRI has 11,460 slices from 31 patients, many of them repeat scans of the same anatomy. To suit the smaller dataset and a single GPU, the priors have half the paper's width and 10–12 layers instead of 20. Their dropout of 0.3 is closer to the 0.25–0.5 the paper used for its smaller FFHQ dataset than to its ImageNet setting. Even so, they overfit within six epochs, so training is stopped early on validation NLL rather than run for a fixed length (see Section 4.3).
 - **Dead-code restarts keep the codebooks in use.** With few, similar slices on a black background, codes can fall out of use, the risk named in the feasibility review (Section 9.4). A code whose average use drops below once per batch is moved to a random encoder output. Codebook perplexity stayed at 255–391 of 512 at every level (see Section 5.1).
@@ -470,8 +454,33 @@ Unless stated otherwise, the answers below refer to the SSIM-loss VQ-VAE-2 sampl
 
 **Overall:** VQ-VAE-2 answers the research question positively on novelty, diversity and fidelity, and beats the single-level baseline on fidelity and realism. The generated cohort is a non-memorised starting point but not yet a validated, or viable, substitute for real scans.
 
-## 7. AI Usage Disclosure
-[placeholder]
+## 7. Artificial Intelligence Usage Disclosure
+I used Anthropic's **Claude Code** to assist me in completing this project, running the Claude Opus 5.5 model. It had no access to the Rangpur cluster, so I launched every training and evaluation job myself and copied the logs and outputs back.
+
+### Usage
+- **Code.** For each stage I wrote a checklist of requirements, such as "clip each slice at the 99.5th percentile", "top codes 32 × 16, bottom codes 64 × 32" and "check gradients reach the encoder through the straight-through estimator". Claude Code wrote the first implementation of each checklist: 
+    - loading, caching and the leakage check in `dataset.py`
+    - the vector quantiser, encoder, decoder and PixelCNN priors in `modules.py`
+    - the training loop with early stopping in `train.py`
+    - the reconstruction, sampling, FID, memorisation audit, interpolation and failure autopsy tasks in `predict.py`. 
+
+- **Debugging.** Examples include tracing a crash in the failure autopsy to the segmentation-mask loading, after which I removed the masks from the autopsy, and tracing why the baseline's plot marks epoch 45 while its checkpoint is epoch 38 (Section 4.3).
+- **Concept lookup.** Explaining the commitment cost β = 0.25, dead-code restarts, causal attention in the top prior, sampling temperature and how to read the t-SNE plots.
+- **Experiment planning.** Discussing ways to improve sample quality, such as separate top and bottom temperatures, a smaller prior and rejection sampling, and writing the job scripts for each sweep. I chose which experiments to run and which temperatures to sweep.
+- **Writing.** Claude Code drafted most of this README from my checklist set of instructions and the run outputs, including the feasibility review, the results analysis and the conclusion. Any drafted work was read over by me, prior to commiting and pushing to the repository.
+
+### Verification
+- **Automated checks.** `scripts/check_modules.py` and `scripts/check_priors.py` test the model code on random input and pass on the submitted code. They assert that:
+  - the code maps are 32 × 16 and 64 × 32;
+  - reconstruction loss reaches both encoders through the straight-through estimator, while commitment loss never reaches the decoder;
+  - the codebook is frozen in evaluation, updated by EMA in training, and restarts dead codes;
+  - every prior is causal, so changing the current code or any later one leaves its prediction unchanged, and has no blind spot;
+  - the bottom prior's output depends on the top codes, and seeded sampling is reproducible.
+- **Data leakage.** `build_datasets` asserts on every load that no patient appears in more than one split. Early stopping and checkpoint selection use the validation split only.
+- **Visual inspection.** The slice grid and intensity histogram (Section 3) confirmed orientation and normalisation before training. Reconstructions, error maps, samples and nearest-training-slice pairs were viewed before they were written about.
+- **Results against logs.** Every number in Section 5 comes from `assets/results.md`, which `predict.py report` writes from the run outputs. `scripts/plot_results.py` builds the comparison figures from the same file. Claims about training were checked against the per-epoch logs, which is how the top-codebook collapse at epoch 42 was found (Section 4.1).
+
+I am personally responsible for every line of code, loss formula, metric and claim in this submission, including the parts Claude Code drafted. No code was copied from other students or reused from previous submissions. The published work this project builds on is cited in Section 8.
 
 ## 8. References
 - Dowling, J., & Greer, P. (2021). *Labelled weekly MR images of the male pelvis* [Data set]. CSIRO. https://doi.org/10.25919/45t8-p065
