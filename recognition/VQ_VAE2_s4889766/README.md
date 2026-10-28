@@ -385,15 +385,23 @@ The first sweep used the SSIM-loss model, with $T_\text{top}$ and $T_\text{botto
 *Uncurated samples for each setting of the first sweep: the first six of 512. Rows with the same $T_\text{top}$ share their top codes, so each column keeps its overall layout across those rows and only the texture changes.*
 
 ### 6.6 Extending the separate temperatures
-The second sweep took $T_\text{top}$ up to 1.0 and 1.1 and $T_\text{bottom}$ down to 0.6 and 0.5. It reused the samples already drawn at 0.9/0.7. The full grid is below, in the same format as before.
+The second sweep took $T_\text{top}$ up to 1.0 and 1.1 and $T_\text{bottom}$ down to 0.6 and 0.5. It reused the samples already drawn at 0.9/0.7, so that setting appears in both tables below, which use the same format as before.
 
-| $T_\text{top}$ \ $T_\text{bottom}$ | 0.5 | 0.6 | 0.7 | 0.8 | 0.9 | 1.0 |
-|---|---|---|---|---|---|---|
-| 0.7 | | | 128.9 / 23 | 137.2 / 29 | 155.9 / 21 | |
-| 0.8 | | | 107.2 / 28 | 120.1 / 18 | 137.5 / 10 | |
-| 0.9 | 82.4 / 10 | 84.5 / 20 | 94.4 / 12 | 106.2 / 12 | 129.5 / 4 | |
-| 1.0 | 77.3 / 11 | 81.7 / 11 | 93.3 / 4 | | | 159.0 / 4 |
-| 1.1 | **77.9 / 0** | 85.3 / 2 | 96.4 / 6 | | | |
+**First sweep** (Section 6.5):
+
+| $T_\text{top}$ \ $T_\text{bottom}$ | 0.7 | 0.8 | 0.9 |
+|---|---|---|---|
+| 0.7 | 128.9 / 23 | 137.2 / 29 | 155.9 / 21 |
+| 0.8 | 107.2 / 28 | 120.1 / 18 | 137.5 / 10 |
+| 0.9 | 94.4 / 12 | 106.2 / 12 | 129.5 / 4 |
+
+**Second sweep:**
+
+| $T_\text{top}$ \ $T_\text{bottom}$ | 0.5 | 0.6 | 0.7 |
+|---|---|---|---|
+| 0.9 | 82.4 / 10 | 84.5 / 20 | 94.4 / 12 |
+| 1.0 | 77.3 / 11 | 81.7 / 11 | 93.3 / 4 |
+| 1.1 | **77.9 / 0** | 85.3 / 2 | 96.4 / 6 |
 
 <img src="assets/results/tradeoff.png" width="85%">
 
@@ -406,7 +414,7 @@ The second sweep took $T_\text{top}$ up to 1.0 and 1.1 and $T_\text{bottom}$ dow
 
 *Uncurated samples from the second sweep: the first six of 512 at each setting.*
 
-Across the full grid, the two temperatures do different jobs:
+Across both sweeps, the two temperatures do different jobs:
 
 - **$T_\text{bottom}$ sets realism.** In every row, FID falls as $T_\text{bottom}$ falls. At $T_\text{top} = 0.9$, it drops from 129.5 at $T_\text{bottom} = 0.9$ to 82.4 at 0.5.
 - **$T_\text{top}$ sets novelty.** At a fixed $T_\text{bottom}$, the median nearest-train SSIM falls as $T_\text{top}$ rises. At $T_\text{bottom} = 0.7$, it goes from 0.360 at $T_\text{top} = 0.7$ to 0.302 at 1.1. Hotter top sampling produces layouts further from every training slice.
