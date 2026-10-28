@@ -9,7 +9,7 @@
 
 *The two stages of VQ-VAE-2 as implemented in `modules.py`.*
 
-VQ-VAE-2 (Razavi et al., 2019) generates images in two stages. In stage 1 (top half of the figure), a hierarchical autoencoder turns each 256×128 slice into two grids of discrete codes. The bottom encoder downsamples the slice 4× with strided convolutions and residual blocks, and the top encoder downsamples it a further 2×. Each level then replaces every latent vector with the nearest of its 512 learned 64-dimensional codes. This gives a 32×16 top code map for the global layout and a 64×32 bottom code map for local detail. The bottom level is quantised only after it sees the decoded top codes, so it can focus on what the top level misses. The decoder upsamples the top codes, concatenates them with the bottom codes and reconstructs the slice. Gradients pass the nearest-code lookup by the straight-through estimator, and the codebooks are updated by moving averages rather than by gradient (see Section 4). Setting `levels: 1` removes the top level, which gives the single-level baseline.
+VQ-VAE-2 (Razavi et al., 2019) generates images in two stages. In stage 1 (top half of the figure), a hierarchical autoencoder turns each 256×128 slice into two grids of discrete codes. The bottom encoder downsamples the slice 4× with strided convolutions and residual blocks, and the top encoder downsamples it a further 2×. Each level then replaces every latent vector with the nearest of its 512 learned 64-dimensional codes. This gives a 32×16 top code map for the global layout and a 64×32 bottom code map for local detail. The bottom level is quantised only after it sees the decoded top codes, so it can focus on what the top level misses. The decoder upsamples the top codes, concatenates them with the bottom codes and reconstructs the slice. Gradients pass the nearest-code lookup by the straight-through estimator, and the codebooks are updated by moving averages rather than by gradient (see Section 5). Setting `levels: 1` removes the top level, which gives the single-level baseline.
 
 Stage 2 (bottom half) learns which code maps are likely, using gated PixelCNN priors (van den Oord et al., 2016) that predict each code from the codes before it in raster order. The top prior has 12 masked-convolution layers (kernel 5, 256 channels) with causal self-attention after every fourth layer, so each code can attend to the whole layout drawn so far. The bottom prior has 10 layers and no attention, which would be costly in memory over 2,048 positions. Instead, it receives the top codes through a conditioning stack of 8 residual blocks and a 2× upsample, added to every layer. To generate a slice, the top prior draws 512 codes one at a time, the bottom prior draws 2,048 codes given them, and the frozen stage-1 decoder turns both maps into an image. Before each draw, the logits are divided by a temperature $T$, which trades realism against variety. The baseline's single prior has the same design as the top prior, applied to its 64×32 map. Each prior has about 52M parameters, against 1.71M for the stage-1 model.
 
@@ -17,14 +17,62 @@ Stage 2 (bottom half) learns which code maps are likely, using gated PixelCNN pr
 The paper's main model generates 256×256 ImageNet images (Razavi et al., 2019, Tables 3 and 5). This is how the model built here differs from it:
 
 - **Stage 1 otherwise follows the paper.** It keeps the paper's 128 hidden and 64 residual channels, 2 residual blocks, 512 codes of 64 dimensions, $\beta = 0.25$ and EMA decay 0.99. The single input channel and the 256×128 slices halve both code maps, with the same 4× and 8× downsampling.
-- **The priors are smaller and more regularised.** ImageNet has 1.28 million training images, while HipMRI has 11,460 slices from 31 patients, many of them repeat scans of the same anatomy. To suit the smaller dataset and a single GPU, the priors have half the paper's width and 10–12 layers instead of 20. Their dropout of 0.3 is closer to the 0.25–0.5 the paper used for its smaller FFHQ dataset than to its ImageNet setting. Even so, they overfit within six epochs, so training is stopped early on validation NLL rather than run for a fixed length (see Section 4.3).
-- **Dead-code restarts keep the codebooks in use.** With few, similar slices on a black background, codes can fall out of use, the risk named in the feasibility review (Section 9.4). A code whose average use drops below once per batch is moved to a random encoder output. Codebook perplexity stayed at 255–391 of 512 at every level (see Section 5.1).
+- **The priors are smaller and more regularised.** ImageNet has 1.28 million training images, while HipMRI has 11,460 slices from 31 patients, many of them repeat scans of the same anatomy. To suit the smaller dataset and a single GPU, the priors have half the paper's width and 10–12 layers instead of 20. Their dropout of 0.3 is closer to the 0.25–0.5 the paper used for its smaller FFHQ dataset than to its ImageNet setting. Even so, they overfit within six epochs, so training is stopped early on validation NLL rather than run for a fixed length (see Section 5.3).
+- **Dead-code restarts keep the codebooks in use.** With few, similar slices on a black background, codes can fall out of use, the risk named in the feasibility review (Section 2.4). A code whose average use drops below once per batch is moved to a random encoder output. Codebook perplexity stayed at 255–391 of 512 at every level (see Section 6.1).
 - **An optional SSIM term targets the fidelity criterion.** The paper optimises MSE only. Because fidelity is judged by SSIM, one variant adds $0.01\,(1 - \mathrm{SSIM})$ to the loss. It raised test SSIM from 0.941 to 0.953 and lowered FID at every shared temperature.
-- **There are no labels, so the priors are unconditional.** The paper conditions its ImageNet priors on the class, and trades diversity for quality by rejecting samples that a pretrained classifier does not recognise. Neither is possible here. The sampling temperature controls that trade-off instead, and Section 5.5 shows that setting it separately for each prior works best.
+- **There are no labels, so the priors are unconditional.** The paper conditions its ImageNet priors on the class, and trades diversity for quality by rejecting samples that a pretrained classifier does not recognise. Neither is possible here. The sampling temperature controls that trade-off instead, and Section 6.5 shows that setting it separately for each prior works best.
 - **The baseline's prior also has attention.** Its single prior copies the top prior's design, so it also sees global context across its 2,048 codes. The comparison therefore tests the hierarchy rather than the attention.
 
 
-## 2. Dependencies & Usage
+## 2. Feasibility Review
+### 2.1 User Need, Scope & Acceptance Criteria
+The users are researchers who need shareable synthetic HipMRI slices (256×128) without releasing real scans, which would otherwise violate patient confidentiality. The central dilemma is training a model that produces 'realistic' images, potentially for downstream tasks, while also ensuring that the model does not memorise training images.
+
+The acceptance criteria are:
+
+1. **Fidelity:** Test reconstruction is recorded at SSIM > 0.6.
+2. **Realism:** FID recorded below the baseline model's FID.
+3. **No memorisation:** No latent samples have a high SSIM with a training slice, verified via some nearest-neighbour search.
+4. **Diversity:** No mode collapse in uncurated grids or t-SNE, and latent interpolations show no 'jumps'.
+
+### 2.2 Model Choice
+VQ-VAE-2 (Razavi et al., 2019) trains in two stages. Stage 1 encodes each slice into 64×32 and 32×16 latents, replaces each latent vector $z$ with its nearest of $K = 512$ codes $e \in \mathbb{R}^{64}$, and decodes with loss
+
+$$\mathcal{L} = \lVert x - \hat{x} \rVert_2^2 + \beta \lVert z - \mathrm{sg}[e] \rVert_2^2, \qquad \beta = 0.25,$$
+
+where sg is the stop-gradient. The codes in the codebook are EMA-updated with decay 0.99 with unchosen codes resetting, i.e., moving to a randomly chosen encoder output (van den Oord et al., 2017).
+
+Stage 1 leaves every image as a small grid of labels, where each label describes what one little patch of the image looks like. Instead of drawing 32,768 pixels, we only need to create two small grids of labels: 64×32 for the global detail and 32×16 for the finer detail. **Stage 2** learns how those labels are usually arranged, and walks the grid one label at a time. While doing so, the next label is predicted from everything it has already seen. With teacher-forced cross-entropy, the model corrects any wrong guesses as it pertains to the label prediction. The **top** prior draws the global grid first, which essentially produces the scans' outline and decides where the organs go. The **bottom** prior then fills in the fine grid with the top model as reference, so the detail matches the layout. 
+
+To generate a new image, the top model picks labels one by one, with the bottom model following. The decoder then turns the two label grids back into an image. The temperature $T$ of sampling essentially determines how varied our generations can be, e.g. low values are more deterministic and repetitive, while high values are more varied / novel but also more error-prone since its so varied.
+
+**Why VQ-VAE2 over a standard VQ-VAE:** 
+
+An MRI slice has both a global layout (the outline of the body and the organs) and local texture in the tissue / bones. A single-level VQ-VAE's prior both places the organs while predicting 2,048 codes one at a time. This means that any early prediction errors can ultimately affect later predictions. With VQ-VAE-2, we delegate these steps to seperate priors such that we fix the layout in 512 steps with attention over the whole slice. Then, the bottom codes add detail on top of it. Therefore, I will consider the 1-level VQ-VAE to be the baseline model for the experiment.
+
+### 2.3 Preliminary Evidence of Feasibility
+<img src="assets/feasibility_recon.png" width="80%">
+
+- **Data audit:** 12,660 slices from 38 patients in the HipMRI study (Dowling & Greer, 2021), split by patient (train 11,460 / 31 patients, validate 660 / 4 patients, test 540 / 3 patients).
+- **Stage-1 test** (validation): after 6 minutes on an A100, SSIM 0.932 $\pm$ 0.011 and PSNR 31.6 dB.
+- **Priors:** ~52 M parameter gated PixelCNN (van den Oord et al., 2016) used, which samples at around 3s per image.
+
+### 2.4 Risks, Budget & Fallback
+| Risk | Warning sign | Mitigation |
+|---|---|---|
+| Memorisation | Validation NLL rises | Use early stopping to prevent overfitting, and the nearest-neighbour audit |
+| Unused Codes | Perplexity of codebook falls | Use EMA updates, and force some random restart of the codebook. |
+
+**Budget:** 1x A100-40GB GPU for training and sampling. 
+
+**Next steps:** 
+
+1. Train the PixelCNN priors for sampling generated images in stage 2.
+2. sweep the sampling temperature $T$ and measure FID.
+3. Experiment with using some weighted loss that targets SSIM.
+
+
+## 3. Dependencies & Usage
 The code needs Python 3.11 or newer, which the pinned numpy and scipy require. These are the packages it imports directly, at the versions used for the results:
 
 | Package | Version | Used for |
@@ -59,7 +107,7 @@ python scripts/check_modules.py       # shape, gradient and codebook checks on r
 python scripts/check_priors.py        # causality and conditioning checks for the priors
 ```
 
-**Training.** The commands are listed in Section 4. Each stage-1 run is saved to `checkpoints/vqvae2_L<levels>_ssim<weight>/`, and its code maps and priors are saved inside it.
+**Training.** The commands are listed in Section 5. Each stage-1 run is saved to `checkpoints/vqvae2_L<levels>_ssim<weight>/`, and its code maps and priors are saved inside it.
 
 **Evaluation.** `predict.py` takes a stage-1 run directory. Each task writes its numbers to `<run>/eval/<task>.json` and its figures to `assets/`.
 
@@ -75,7 +123,8 @@ python predict.py report checkpoints/vqvae2_L2_ssim0 checkpoints/vqvae2_L1_ssim0
 python scripts/plot_results.py assets/results.md   # comparison plots in assets/results/
 ```
 
-## 3. Dataset and Preprocessing
+
+## 4. Dataset and Preprocessing
 The data are the 2D slices of the HipMRI study (Dowling & Greer, 2021): weekly MR scans of the male pelvis from 38 patients in a prostate cancer study. Each scan is a stack of 60 coronal slices of 256×128 pixels, stored one slice per NIfTI file. Patients have between one and eight weekly scans, 211 in all. The dataset comes split by patient, and `dataset.py` checks that no patient appears in two splits.
 
 | Split | Patients | Scans | Slices |
@@ -107,14 +156,15 @@ The data are the 2D slices of the HipMRI study (Dowling & Greer, 2021): weekly M
 - **A training slice's mean intensity ranges from 0.11 to 0.38,** with a median of 0.21. The failure autopsy uses this range to spot over-bright samples.
 - **Position in the stack changes the anatomy.** The early and middle slices show the bladder between the femoral heads, while the late slices show mostly bowel, bone and muscle, and are brighter.
 
-## 4. Training
+
+## 5. Training
 Both models are trained by `train.py` in three steps, with the settings in `configs/vqvae2.yml`. Every run used seed 0 and one NVIDIA A100 (40 GB) on the Rangpur cluster. The data are split by patient: 11,460 slices from 31 patients for training and 660 from 4 for validation. The validation slices only pick checkpoints and stop training. The three test patients are held back for the Results.
 
 **Stage 1: the VQ-VAE.** Adam (learning rate $3 \times 10^{-4}$, batch 64) minimises
 
 $$\mathcal{L} = \lVert x - \hat{x} \rVert_2^2 + \beta \sum_\text{levels} \lVert z - \mathrm{sg}[e] \rVert_2^2 + w\bigl(1 - \mathrm{SSIM}(x, \hat{x})\bigr), \qquad \beta = 0.25,$$
 
-with $w = 0$ for VQ-VAE-2 and the baseline, and $w = 0.01$ for the SSIM-loss variant. The codebooks get no gradient. Each code follows an exponential moving average (decay 0.99) of the encoder outputs assigned to it, and a code used less than about once per batch is restarted at a random encoder output. Training is stopped early on validation SSIM, as described in Section 4.3.
+with $w = 0$ for VQ-VAE-2 and the baseline, and $w = 0.01$ for the SSIM-loss variant. The codebooks get no gradient. Each code follows an exponential moving average (decay 0.99) of the encoder outputs assigned to it, and a code used less than about once per batch is restarted at a random encoder output. Training is stopped early on validation SSIM, as described in Section 5.3.
 
 **Encoding.** The kept stage-1 checkpoint is frozen and turns every slice into code maps: 32×16 top and 64×32 bottom codes for VQ-VAE-2, and a single 64×32 map for the baseline.
 
@@ -141,7 +191,7 @@ python train.py --ssim-loss-weight 0.01  # stage 1, SSIM-loss variant; its prior
 
 Each pipeline trains in about 40–45 minutes, most of it spent on the priors.
 
-### 4.1 Stage 1 curves
+### 5.1 Stage 1 curves
 <img src="assets/results/loss_curves_vqvae2.png" width="100%">
 
 *VQ-VAE-2's stage-1 training. Top row: reconstruction loss, commitment loss and codebook perplexity for each level. Bottom row: validation SSIM and PSNR for the full reconstruction and for the top level decoded alone. The dotted line marks the highest validation SSIM.*
@@ -154,10 +204,10 @@ Each pipeline trains in about 40–45 minutes, most of it spent on the priors.
 - **Most of the gain comes early.** Validation SSIM climbs steeply for about 10 epochs and is nearly flat after epoch 20.
 - **VQ-VAE-2's top codebook briefly collapsed at epoch 42.** Its validation perplexity fell from about 410 to 100 for one epoch, while the reconstruction loss jumped and validation SSIM dipped. Both recovered within two epochs, and the bottom codebook barely moved. The checkpoint used in the Results is from epoch 41, just before the collapse, and no later epoch beat it.
 - **Code use rises, then narrows, without collapsing.** In both models, bottom perplexity peaks above 400 around epoch 5, then falls slowly to 265–300 of 512. VQ-VAE-2's top perplexity is noisier and peaks later, near 480 at epoch 29.
-- **The top level alone stays weak.** Decoded on its own, it rises only from 0.12 to about 0.2 validation SSIM over training. This is the near-black top-only reconstruction shown in Section 5.1.
+- **The top level alone stays weak.** Decoded on its own, it rises only from 0.12 to about 0.2 validation SSIM over training. This is the near-black top-only reconstruction shown in Section 6.1.
 - **The commitment loss rises steadily after the first few epochs** in both models, meaning the encoder outputs drift further from their nearest codes as training goes on. The reconstruction loss still falls over the same epochs.
 
-### 4.2 Prior curves
+### 5.2 Prior curves
 <img src="assets/results/prior_nll_vqvae2.png" width="66%"> <img src="assets/results/prior_nll_baseline.png" width="33%">
 
 *Training and validation NLL in bits per code for VQ-VAE-2's top and bottom priors (left) and the baseline's single prior (right). The baseline's prior models its only level, a 64×32 map, so its plot is titled "Bottom prior". The dotted line marks the lowest validation NLL, which is the kept checkpoint. A uniform guess over 512 codes costs 9 bits.*
@@ -165,15 +215,16 @@ Each pipeline trains in about 40–45 minutes, most of it spent on the priors.
 - **Every prior overfits within six epochs.** Validation NLL is lowest at epoch 5 or 6: 7.47 bits per code for the top prior, 5.15 for the bottom prior and 5.34 for the baseline's. After that, it rises while the training NLL keeps falling. By the last epoch, the top prior's gap is 2.2 bits (6.1 against 8.3).
 - **Top codes are harder to predict.** Each costs 7.47 bits, only 1.5 below a uniform guess, against 5.15 for a bottom code. A top code covers an 8×8 patch of the slice rather than 4×4, and the bottom prior has the top codes to guide it.
 
-### 4.3 Early stopping
+### 5.3 Early stopping
 Every training stage uses the same rule, in `fit` in `train.py`. After each epoch, the model is scored on the whole validation split. If the monitored metric beats the best so far by more than a threshold, the model is saved as the kept checkpoint and a counter resets. Otherwise the counter goes up, and training stops when it reaches 10 epochs (the patience). Stage 1 monitors validation SSIM with a threshold of $10^{-4}$, and the priors monitor validation NLL with a threshold of $10^{-3}$ bits per code. A second checkpoint, saved every epoch with the counter, lets an interrupted run resume where it left off. No run came near the 100-epoch cap.
 
-For the priors, it is the main guard against overfitting. With about 52M parameters each and only 11,460 training code maps, the priors overfit within six epochs despite a dropout of 0.3. Their validation NLL rose in every epoch after the best one, so each kept its epoch-5 or epoch-6 checkpoint. This is the mitigation the feasibility review (Section 9.4) planned for its memorisation warning sign, a rising validation NLL. It limits memorisation but cannot rule it out, so the samples are audited in the Results.
+For the priors, it is the main guard against overfitting. With about 52M parameters each and only 11,460 training code maps, the priors overfit within six epochs despite a dropout of 0.3. Their validation NLL rose in every epoch after the best one, so each kept its epoch-5 or epoch-6 checkpoint. This is the mitigation the feasibility review (Section 2.4) planned for its memorisation warning sign, a rising validation NLL. It limits memorisation but cannot rule it out, so the samples are audited in the Results.
 
-## 5. Results
+
+## 6. Results
 Stage 1 comes first: how well each model reconstructs patients it never saw. The samples from stage 2 follow, judged on realism and memorisation, and the section ends with latent interpolations.
 
-### 5.1 Reconstruction
+### 6.1 Reconstruction
 Each model reconstructed the 540 slices of the three test patients. Reconstructions are scored against the originals by SSIM (Wang et al., 2004) and PSNR.
 
 | Model | SSIM | PSNR (dB) | Top-only SSIM | Codebook perplexity (top / bottom) |
@@ -192,7 +243,7 @@ Each model reconstructed the 540 slices of the three test patients. Reconstructi
 - **VQ-VAE-2 reconstructs better than the baseline on every test patient.** Overall it gains 0.012 SSIM and 1.0 dB PSNR. The gap is about one SD, so the two spreads overlap, but the order holds for all three patients. VQ-VAE-2 also has twice the stage-1 parameters (1.71M against 0.82M), so part of the gain may come from capacity rather than from the second level.
 - **Inception features agree.** FID compares Inception-v3 features (Szegedy et al., 2016) of two image sets. VQ-VAE-2's reconstructions score an FID of 78.2 against the training slices, against 87.6 for the baseline's. The real test slices score 62.6.
 - **The SSIM loss adds a further 0.012 SSIM and 0.4 dB.** It also spreads the bottom level over more of its codebook (perplexity 287 against 260).
-- **No codebook collapsed onto a few codes,** the risk named in the feasibility review (Section 9.4). Perplexity stays between 255 and 391 of 512 at every level.
+- **No codebook collapsed onto a few codes,** the risk named in the feasibility review (Section 2.4). Perplexity stays between 255 and 391 of 512 at every level.
 
 <img src="assets/results/reconstructions_vqvae2.png" width="100%">
 
@@ -205,7 +256,7 @@ Each model reconstructed the 540 slices of the three test patients. Reconstructi
 - **The errors sit on fine structure.** In both models, they concentrate on tissue edges and the textured centre of the pelvis, such as the bowel loops and the bladder wall. The background and flat muscle are almost error-free. The reconstructions lose some fine texture, not anatomy.
 - **The top level alone reconstructs almost nothing** (SSIM 0.22, a near-black frame), so the decoder draws nearly all of its content from the bottom codes. Zeroed bottom codes are an input the decoder never saw in training, so this understates what the top level holds. Its main role shows up in sampling instead: the bottom prior is conditioned on the top codes, which is why $T_\text{top}$ changes the layout of samples in the separate-temperature sweeps below.
 
-### 5.2 Latent interpolation
+### 6.2 Latent interpolation
 Interpolation tests whether the latent space is continuous. Each model was given the same four pairs of test slices, taken from different patients at the same slice index. For each pair, the two slices' encoder outputs are blended before quantisation, $(1 - a)\,z_A + a\,z_B$, for nine values of $a$ from 0 to 1. Each blend is then quantised and decoded.
 
 Smoothness is measured as the change between consecutive frames, 1 − SSIM. A jump would show as one step much larger than the rest, so each path is scored by its largest step divided by its median step.
@@ -233,7 +284,7 @@ Smoothness is measured as the change between consecutive frames, 1 − SSIM. A j
 - **The two models behave alike.** The baseline's frames look almost the same as VQ-VAE-2's. Both have their largest step in the same place, the last step of the 040/041 pair (0.091). That step reflects the pair rather than either model.
 
 
-### 5.3 Shared sampling temperature
+### 6.3 Shared sampling temperature
 Every sampling setting in this and the following sections draws 512 samples from the same seed. Two measures are used throughout:
 
 - **FID** against the 11,460 training slices, where lower is more realistic. Real slices from the three unseen test patients score 62.6, roughly where a generator of genuinely new patients would sit.
@@ -266,7 +317,7 @@ Each model was first sampled with one temperature, $T$, shared by all of its pri
 
 The grids match the scores. At $T = 0.8$, half of the VQ-VAE-2 samples show a bright bladder inside a recognisable pelvis, with the femoral heads on either side. At 0.9 and 1.0, most become a tangle of tissue texture with no clear organs. The baseline's samples are smoother and lower in contrast, several frames are foggy, and some of its bladders at $T = 1.0$ are misshapen.
 
-### 5.4 Memorisation
+### 6.4 Memorisation
 At a lower temperature, the priors favour their most likely codes, and those are the codes that rebuild training slices. Realism and memorisation can therefore rise together, so every setting was audited.
 
 **Where the samples sit.**
@@ -305,7 +356,7 @@ Under a shared temperature, the setting where the two-level model is most realis
 - **The closest samples come from few patients.** VQ-VAE-2's six trace back to three training patients (018, 026 and 027). Four of the baseline's six trace back to slices 29–32 of patient 027.
 - **The baseline has favourite patients too, even though few of its samples are flagged.** At the code level it is the closer model: its closest sample shares 33.8% of its codes with a training slice, against 29.1% for VQ-VAE-2's bottom level and 20.2% for the test slices.
 
-### 5.5 Separate temperatures
+### 6.5 Separate temperatures
 A shared temperature ties together two different choices. The top prior decides the layout and the bottom prior the texture. Cooling both to sharpen the texture also pulls the layouts toward the training set. Cooling further makes things worse:
 
 - **VQ-VAE-2 at $T = 0.7$:** FID barely moves (131.3), while the flagged samples double to 75.
@@ -333,7 +384,7 @@ The first sweep used the SSIM-loss model, with $T_\text{top}$ and $T_\text{botto
 
 *Uncurated samples for each setting of the first sweep: the first six of 512. Rows with the same $T_\text{top}$ share their top codes, so each column keeps its overall layout across those rows and only the texture changes.*
 
-### 5.6 Extending the separate temperatures
+### 6.6 Extending the separate temperatures
 The second sweep took $T_\text{top}$ up to 1.0 and 1.1 and $T_\text{bottom}$ down to 0.6 and 0.5. It reused the samples already drawn at 0.9/0.7. The full grid is below, in the same format as before.
 
 | $T_\text{top}$ \ $T_\text{bottom}$ | 0.5 | 0.6 | 0.7 | 0.8 | 0.9 | 1.0 |
@@ -383,7 +434,7 @@ Even the closest samples at this setting stop at the reference maximum (SSIM 0.4
   - No sample shares more than 17.8% of its top codes, or 24.1% of its bottom codes, with any training slice. That is far from a copy.
   - Both figures are still above the test patients' 10.2% and 16.2%, so at the code level the samples sit closer to the training data than new patients do.
 
-### 5.7 Failure autopsy
+### 6.7 Failure autopsy
 The audits above look at the samples closest to the training set. The autopsy looks at the other end: the samples at 1.1/0.5 least like any training slice, meaning those with the lowest nearest-train SSIM. `predict.py autopsy` picks them by this fixed rule rather than by eye. It shows each one beside the same sample drawn at the other bottom temperatures, which share its top codes. A flaw that persists across them comes from the top prior, and one that changes comes from the bottom prior.
 
 <img src="assets/results/autopsy_candidates_t1.1_0.5.png" width="100%">
@@ -405,10 +456,11 @@ The audits above look at the samples closest to the training set. The autopsy lo
 - **The failure starts in the top codes.** With the same top codes, $T_\text{bottom} = 0.6$ and $0.7$ also give over-bright, broken slices (mean 0.40–0.53, still above every training slice). The body outline stays about the same, and only the interior detail changes, never into coherent anatomy. A colder bottom prior cannot rescue a bad top map. Whether the hot $T_\text{top}$ of 1.1 causes these failures needs the same autopsy at a cooler setting, such as 0.9/0.5.
 - **At least 13 of the 512 samples (2.5%) fail this way.** This is a lower bound, since only the 16 lowest were inspected. Because these samples are brighter than any training slice, a simple check against the brightest training slice would catch most of them before samples are shared.
 
-## 6. Conclusion
+
+## 7. Conclusion
 Unless stated otherwise, the answers below refer to the SSIM-loss VQ-VAE-2 sampled at the recommended setting, $T_\text{top} = 1.1$ and $T_\text{bottom} = 0.5$.
 
-### 6.1 Against the Acceptance Criteria
+### 7.1 Against the Acceptance Criteria
 
 | Criterion | Target | Result | Met |
 |---|---|---|---|
@@ -417,7 +469,7 @@ Unless stated otherwise, the answers below refer to the SSIM-loss VQ-VAE-2 sampl
 | No memorisation | No sample with a high SSIM to a training slice | No sample is closer to a training slice than a test slice gets. The closest scores 0.435, against about 0.95 for a copy. No sample copies a training slice's codes. | Yes, at the image level |
 | Diversity | No mode collapse, and no jumps in interpolations | No collapse in the t-SNE or the uncurated grids. No interpolation step exceeds 1.31 times its path's median. | Yes |
 
-### 6.2 Core Investigation Findings
+### 7.2 Core Investigation Findings
 - No sample at the recommended setting is closer to a training slice than an unseen patient's slice is.
 - No sample in any of the 28 settings audited, across all three models, copies a training slice's codes exactly.
 - The typical sample is as far from the training set as a new patient: its median nearest-train SSIM is 0.310, against 0.321.
@@ -444,7 +496,7 @@ Unless stated otherwise, the answers below refer to the SSIM-loss VQ-VAE-2 sampl
   - FID combines realism and coverage in one number. Separating them, for example with precision and recall (Kynkäänniemi et al., 2019), was not done.
 - **Memorisation:** the baseline flags only 1–3 samples at each of its five temperatures. At the code level, though, it is the closer model: its samples share up to 36.0% of their codes with a training slice, against at most 31.8% for any VQ-VAE-2 sample at the same code-map size. At the recommended setting, VQ-VAE-2 flags none.
 
-### 6.3 Verdict
+### 7.3 Verdict
 **Non-memorised: Yes, on every test run.** No sample copies a training slice at the image or code level. None is flagged at the recommended setting, and the typical sample is as novel as a new patient. Two loose ends remain: the code agreement above that of new patients, and the recurring patients 026 and 027, which a patient-level audit should check.
 
 **Clinically plausible for downstream training: No.**
@@ -454,7 +506,8 @@ Unless stated otherwise, the answers below refer to the SSIM-loss VQ-VAE-2 sampl
 
 **Overall:** VQ-VAE-2 answers the research question positively on novelty, diversity and fidelity, and beats the single-level baseline on fidelity and realism. The generated cohort is a non-memorised starting point but not yet a validated, or viable, substitute for real scans.
 
-## 7. Artificial Intelligence Usage Disclosure
+
+## 8. Artificial Intelligence Usage Disclosure
 I used Anthropic's **Claude Code** to assist me in completing this project, running the Claude Opus 5.5 model. It had no access to the Rangpur cluster, so I launched every training and evaluation job myself and copied the logs and outputs back.
 
 ### Usage
@@ -464,7 +517,7 @@ I used Anthropic's **Claude Code** to assist me in completing this project, runn
     - the training loop with early stopping in `train.py`
     - the reconstruction, sampling, FID, memorisation audit, interpolation and failure autopsy tasks in `predict.py`. 
 
-- **Debugging.** Examples include tracing a crash in the failure autopsy to the segmentation-mask loading, after which I removed the masks from the autopsy, and tracing why the baseline's plot marks epoch 45 while its checkpoint is epoch 38 (Section 4.3).
+- **Debugging.** Examples include tracing a crash in the failure autopsy to the segmentation-mask loading, after which I removed the masks from the autopsy, and tracing why the baseline's plot marks epoch 45 while its checkpoint is epoch 38 (Section 5.3).
 - **Concept lookup.** Explaining the commitment cost β = 0.25, dead-code restarts, causal attention in the top prior, sampling temperature and how to read the t-SNE plots.
 - **Experiment planning.** Discussing ways to improve sample quality, such as separate top and bottom temperatures, a smaller prior and rejection sampling, and writing the job scripts for each sweep. I chose which experiments to run and which temperatures to sweep.
 - **Writing.** Claude Code drafted most of this README from my checklist set of instructions and the run outputs, including the feasibility review, the results analysis and the conclusion. Any drafted work was read over by me, prior to commiting and pushing to the repository.
@@ -477,61 +530,14 @@ I used Anthropic's **Claude Code** to assist me in completing this project, runn
   - every prior is causal, so changing the current code or any later one leaves its prediction unchanged, and has no blind spot;
   - the bottom prior's output depends on the top codes, and seeded sampling is reproducible.
 - **Data leakage.** `build_datasets` asserts on every load that no patient appears in more than one split. Early stopping and checkpoint selection use the validation split only.
-- **Visual inspection.** The slice grid and intensity histogram (Section 3) confirmed orientation and normalisation before training. Reconstructions, error maps, samples and nearest-training-slice pairs were viewed before they were written about.
-- **Results against logs.** Every number in Section 5 comes from `assets/results.md`, which `predict.py report` writes from the run outputs. `scripts/plot_results.py` builds the comparison figures from the same file. Claims about training were checked against the per-epoch logs, which is how the top-codebook collapse at epoch 42 was found (Section 4.1).
+- **Visual inspection.** The slice grid and intensity histogram (Section 4) confirmed orientation and normalisation before training. Reconstructions, error maps, samples and nearest-training-slice pairs were viewed before they were written about.
+- **Results against logs.** Every number in Section 6 comes from `assets/results.md`, which `predict.py report` writes from the run outputs. `scripts/plot_results.py` builds the comparison figures from the same file. Claims about training were checked against the per-epoch logs, which is how the top-codebook collapse at epoch 42 was found (Section 5.1).
 
-I am personally responsible for every line of code, loss formula, metric and claim in this submission, including the parts Claude Code drafted. No code was copied from other students or reused from previous submissions. The published work this project builds on is cited in Section 8.
+I am personally responsible for every line of code, loss formula, metric and claim in this submission, including the parts Claude Code drafted. No code was copied from other students or reused from previous submissions. The published work this project builds on is cited in Section 9.
 
-## 8. References
+
+## 9. References
 - Dowling, J., & Greer, P. (2021). *Labelled weekly MR images of the male pelvis* [Data set]. CSIRO. https://doi.org/10.25919/45t8-p065
 - Razavi, A., van den Oord, A., & Vinyals, O. (2019). Generating diverse high-fidelity images with VQ-VAE-2. In *Advances in Neural Information Processing Systems 32*. https://arxiv.org/abs/1906.00446
 - van den Oord, A., Kalchbrenner, N., Vinyals, O., Espeholt, L., Graves, A., & Kavukcuoglu, K. (2016). Conditional image generation with PixelCNN decoders. In *Advances in Neural Information Processing Systems 29*. https://arxiv.org/abs/1606.05328
 - van den Oord, A., Vinyals, O., & Kavukcuoglu, K. (2017). Neural discrete representation learning. In *Advances in Neural Information Processing Systems 30*. https://arxiv.org/abs/1711.00937
-
-
-## 9. Feasibility Review
-### 9.1 User Need, Scope & Acceptance Criteria
-The users are researchers who need shareable synthetic HipMRI slices (256×128) without releasing real scans, which would otherwise violate patient confidentiality. The central dilemma is training a model that produces 'realistic' images, potentially for downstream tasks, while also ensuring that the model does not memorise training images.
-
-The acceptance criteria are:
-
-1. **Fidelity:** Test reconstruction is recorded at SSIM > 0.6.
-2. **Realism:** FID recorded below the baseline model's FID.
-3. **No memorisation:** No latent samples have a high SSIM with a training slice, verified via some nearest-neighbour search.
-4. **Diversity:** No mode collapse in uncurated grids or t-SNE, and latent interpolations show no 'jumps'.
-
-### 9.2 Model Choice
-VQ-VAE-2 (Razavi et al., 2019) trains in two stages. Stage 1 encodes each slice into 64×32 and 32×16 latents, replaces each latent vector $z$ with its nearest of $K = 512$ codes $e \in \mathbb{R}^{64}$, and decodes with loss
-
-$$\mathcal{L} = \lVert x - \hat{x} \rVert_2^2 + \beta \lVert z - \mathrm{sg}[e] \rVert_2^2, \qquad \beta = 0.25,$$
-
-where sg is the stop-gradient. The codes in the codebook are EMA-updated with decay 0.99 with unchosen codes resetting, i.e., moving to a randomly chosen encoder output (van den Oord et al., 2017).
-
-Stage 1 leaves every image as a small grid of labels, where each label describes what one little patch of the image looks like. Instead of drawing 32,768 pixels, we only need to create two small grids of labels: 64×32 for the global detail and 32×16 for the finer detail. **Stage 2** learns how those labels are usually arranged, and walks the grid one label at a time. While doing so, the next label is predicted from everything it has already seen. With teacher-forced cross-entropy, the model corrects any wrong guesses as it pertains to the label prediction. The **top** prior draws the global grid first, which essentially produces the scans' outline and decides where the organs go. The **bottom** prior then fills in the fine grid with the top model as reference, so the detail matches the layout. 
-
-To generate a new image, the top model picks labels one by one, with the bottom model following. The decoder then turns the two label grids back into an image. The temperature $T$ of sampling essentially determines how varied our generations can be, e.g. low values are more deterministic and repetitive, while high values are more varied / novel but also more error-prone since its so varied.
-
-**Why VQ-VAE2 over a standard VQ-VAE:** 
-
-An MRI slice has both a global layout (the outline of the body and the organs) and local texture in the tissue / bones. A single-level VQ-VAE's prior both places the organs while predicting 2,048 codes one at a time. This means that any early prediction errors can ultimately affect later predictions. With VQ-VAE-2, we delegate these steps to seperate priors such that we fix the layout in 512 steps with attention over the whole slice. Then, the bottom codes add detail on top of it. Therefore, I will consider the 1-level VQ-VAE to be the baseline model for the experiment.
-
-### 9.3 Preliminary Evidence of Feasibility
-<img src="assets/feasibility_recon.png" width="80%">
-
-- **Data audit:** 12,660 slices from 38 patients in the HipMRI study (Dowling & Greer, 2021), split by patient (train 11,460 / 31 patients, validate 660 / 4 patients, test 540 / 3 patients).
-- **Stage-1 test** (validation): after 6 minutes on an A100, SSIM 0.932 $\pm$ 0.011 and PSNR 31.6 dB.
-- **Priors:** ~52 M parameter gated PixelCNN (van den Oord et al., 2016) used, which samples at around 3s per image.
-
-### 9.4 Risks, Budget & Fallback
-| Risk | Warning sign | Mitigation |
-|---|---|---|
-| Memorisation | Validation NLL rises | Use early stopping to prevent overfitting, and the nearest-neighbour audit |
-| Unused Codes | Perplexity of codebook falls | Use EMA updates, and force some random restart of the codebook. |
-
-**Budget:** 1x A100-40GB GPU for training and sampling. 
-
-**Next steps:** 
-
-1. Train the PixelCNN priors for sampling generated images in stage 2.
-2. sweep the sampling temperature $T$ and measure FID.
-3. Experiment with using some weighted loss that targets SSIM.
