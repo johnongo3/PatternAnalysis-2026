@@ -15,16 +15,101 @@ Stage 2 (bottom half) learns which code maps are likely, using gated PixelCNN pr
 
 
 ## Dependencies & Usage
-[placeholder]
+The code needs Python 3.11 or newer, which the pinned numpy and scipy require. These are the packages it imports directly, at the versions used for the results:
+
+| Package | Version | Used for |
+|---|---|---|
+| torch | 2.12.1 (CUDA 13.0 build) | Models, training and sampling |
+| numpy | 2.4.6 | Array handling |
+| nibabel | 5.4.2 | Reading the NIfTI slices |
+| torchmetrics | 1.9.0 | SSIM, PSNR and the Inception-v3 feature extractor |
+| torch-fidelity | 0.4.0 | Inception-v3 weights for FID |
+| scipy | 1.17.1 | Matrix square root in FID |
+| scikit-learn | 1.9.1 | PCA and t-SNE |
+| matplotlib | 3.11.1 | Figures |
+| PyYAML | 6.0.3 | The config file |
+| tqdm | 4.70.1 | Progress bars |
+
+**Environment.** Create a conda environment with these versions:
+
+```bash
+conda create -n vqvae2 python=3.12
+conda activate vqvae2
+pip install torch==2.12.1 torchvision==0.27.1 --index-url https://download.pytorch.org/whl/cu130
+pip install numpy==2.4.6 nibabel==5.4.2 torchmetrics==1.9.0 torch-fidelity==0.4.0 \
+    scipy==1.17.1 scikit-learn==1.9.1 matplotlib==3.11.1 PyYAML==6.0.3 tqdm==4.70.1
+```
+
+The `--index-url` installs the CUDA 13.0 build used on Rangpur. torchvision is not imported directly, but torch-fidelity needs it, so it is installed from the same index to match torch. On a machine without an NVIDIA GPU, leave out the `--index-url`. The code then runs on Apple's MPS backend or the CPU.
+
+`requirements.txt` is the full environment frozen on the Rangpur cluster.
+
+
+**Data.** Set `data.root` in `configs/vqvae2.yml`, or pass `--root`, to the folder holding `keras_slices_train`, `keras_slices_validate` and `keras_slices_test`. The default is the copy on Rangpur. The first run preprocesses every slice and caches each split under `~/.cache/hipmri_vqvae2` (or `$HIPMRI_CACHE`), so later runs skip the decoding.
+
+```bash
+python dataset.py ROOT                # slices and patients per split, and the patient-leakage check
+python scripts/inspect_data.py ROOT   # the slice grid and intensity histogram below
+python scripts/check_modules.py       # shape, gradient and codebook checks on random input
+python scripts/check_priors.py        # causality and conditioning checks for the priors
+```
+
+**Training.** The commands are listed under Training. Each stage-1 run is saved to `checkpoints/vqvae2_L<levels>_ssim<weight>/`, and its code maps and priors are saved inside it.
+
+**Evaluation.** `predict.py` takes a stage-1 run directory. Each task writes its numbers to `<run>/eval/<task>.json` and its figures to `assets/`.
+
+```bash
+RUN=checkpoints/vqvae2_L2_ssim0.01
+python predict.py all $RUN                     # reconstruct, sample, audit, fid and interpolate
+python predict.py sample $RUN --temperatures 1.1 --bottom-temperatures 0.5
+python predict.py audit $RUN                   # audit and fid score every saved setting
+python predict.py fid $RUN
+python predict.py autopsy $RUN --setting 1.1/0.5
+python predict.py resources checkpoints/vqvae2_L2_ssim0 checkpoints/vqvae2_L1_ssim0
+python predict.py report checkpoints/vqvae2_L2_ssim0 checkpoints/vqvae2_L1_ssim0 $RUN  # assets/results.md
+python scripts/plot_results.py assets/results.md   # comparison plots in assets/results/
+```
 
 ## Dataset and Preprocessing
+The data are the 2D slices of the HipMRI study (Dowling & Greer, 2021): weekly MR scans of the male pelvis from 38 patients in a prostate cancer study. Each scan is a stack of 60 coronal slices of 256×128 pixels, stored one slice per NIfTI file. Patients have between one and eight weekly scans, 211 in all. The dataset comes split by patient, and `dataset.py` checks that no patient appears in two splits.
+
+| Split | Patients | Scans | Slices |
+|---|---|---|---|
+| Train | 31 (004–033, 035) | 191 | 11,460 |
+| Validate | 4 (036–039) | 11 | 660 |
+| Test | 3 (040–042) | 9 | 540 |
+
+- **The training slices hold fewer independent views than their count suggests.** The weekly scans of one patient show the same anatomy, and 21 of the 31 training patients contribute all eight weeks. A model therefore sees each of those patients' anatomy eight times per epoch, which raises the risk of memorisation.
+- **One patient dominates the test set.** Patient 040 has seven scans, 420 of the 540 test slices.
+- **The masks are unused.** The dataset also includes segmentation masks, which this project does not use.
+
+`dataset.py` preprocesses each slice in four steps:
+
+1. **Load.** Each slice is read with nibabel as float32, and the stray third dimension some files carry is dropped.
+2. **Fit to 256×128.** One training scan (patient 019, week 1) is 256×144. Its pixel spacing matches the rest, so it is centre-cropped rather than resized, which keeps its anatomy at the same scale.
+3. **Normalise per slice.** MR intensities have no fixed scale between scans. Each slice is clipped at its own 99.5th percentile, so a few very bright pixels do not compress the rest, then min-max scaled to [0, 1].
+4. **Cache.** Each preprocessed split is saved as one tensor file (about 1.5 GB for the training split) and reloaded on later runs. The cache is rebuilt if the files, the size or the clip percentile change.
+
+No augmentation is used. The arrays are stored with superior along the columns, and every figure rotates them upright.
+
+<img src="assets/slices_train.png" width="100%">
+
+*Sixteen random training slices after preprocessing, labelled by patient (case), week and slice index.*
+
+<img src="assets/intensity_histogram.png" width="70%">
+
+*Pixel intensities after preprocessing, for each split, on a log scale.*
+
+- **The splits have similar intensity distributions.** In each, 8–10% of pixels are exactly 0 (the background) and 0.5% are clipped to 1 by construction. The validation slices are slightly brighter, with a median slice mean of 0.24 against 0.21 for training and 0.20 for test.
+- **A training slice's mean intensity ranges from 0.11 to 0.38,** with a median of 0.21. The failure autopsy uses this range to spot over-bright samples.
+- **Position in the stack changes the anatomy.** The early and middle slices show the bladder between the femoral heads, while the late slices show mostly bowel, bone and muscle, and are brighter.
 
 ## Training
 Both models are trained by `train.py` in three steps, with the settings in `configs/vqvae2.yml`. Every run used seed 0 and one NVIDIA A100 (40 GB) on the Rangpur cluster. The data are split by patient: 11,460 slices from 31 patients for training and 660 from 4 for validation. The validation slices only pick checkpoints and stop training. The three test patients are held back for the Results.
 
 **Stage 1: the VQ-VAE.** Adam (learning rate $3 \times 10^{-4}$, batch 64) minimises
 
-$$\mathcal{L} = \lVert x - \hat{x} \rVert_2^2 + \beta \sum_\text{levels} \lVert z - \mathrm{sg}[e] \rVert_2^2 + w\,\bigl(1 - \mathrm{SSIM}(x, \hat{x})\bigr), \qquad \beta = 0.25,$$
+$$\mathcal{L} = \lVert x - \hat{x} \rVert_2^2 + \beta \sum_\text{levels} \lVert z - \mathrm{sg}[e] \rVert_2^2 + w\bigl(1 - \mathrm{SSIM}(x, \hat{x})\bigr), \qquad \beta = 0.25,$$
 
 with $w = 0$ for VQ-VAE-2 and the baseline, and $w = 0.01$ for the SSIM-loss variant. The codebooks get no gradient. Each code follows an exponential moving average (decay 0.99) of the encoder outputs assigned to it, and a code used less than about once per batch is restarted at a random encoder output. After every epoch, the model is scored on the validation slices. The checkpoint with the highest validation SSIM is kept, and training stops after 10 epochs without a gain of at least $10^{-4}$.
 
@@ -326,7 +411,7 @@ Unless stated otherwise, the answers below refer to the SSIM-loss VQ-VAE-2 sampl
 | No memorisation | No sample with a high SSIM to a training slice | No sample is closer to a training slice than a test slice gets. The closest scores 0.435, against about 0.95 for a copy. No sample copies a training slice's codes. | Yes, at the image level |
 | Diversity | No mode collapse, and no jumps in interpolations | No collapse in the t-SNE or the uncurated grids. No interpolation step exceeds 1.31 times its path's median. | Yes |
 
-### Answering the research question
+### Core Investigation Findings
 - No sample at the recommended setting is closer to a training slice than an unseen patient's slice is.
 - No sample in any of the 28 settings audited, across all three models, copies a training slice's codes exactly.
 - The typical sample is as far from the training set as a new patient: its median nearest-train SSIM is 0.310, against 0.321.
