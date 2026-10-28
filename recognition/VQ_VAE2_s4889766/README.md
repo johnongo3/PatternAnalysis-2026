@@ -20,12 +20,74 @@
 [placeholder]
 
 ## Results
-Every setting below draws 512 samples from the same seed. Two measures are used throughout:
+Stage 1 comes first: how well each model reconstructs patients it never saw. The samples from stage 2 follow, judged on realism and memorisation, and the section ends with latent interpolations.
+
+### Reconstruction
+Each model reconstructed the 540 slices of the three test patients.
+
+| Model | SSIM | PSNR (dB) | Top-only SSIM | Codebook perplexity (top / bottom) |
+|---|---|---|---|---|
+| Baseline (1 level) | 0.929 ± 0.012 | 31.13 ± 1.53 | – | – / 255 |
+| VQ-VAE-2 | 0.941 ± 0.009 | 32.13 ± 1.54 | 0.224 ± 0.047 | 383 / 260 |
+| VQ-VAE-2 + SSIM loss | **0.953 ± 0.009** | **32.49 ± 1.58** | 0.226 ± 0.048 | 391 / 287 |
+
+*Mean ± SD over the test slices. Perplexity is the effective number of codes in use, out of 512.*
+
+<img src="assets/results/reconstruction.png" width="100%">
+
+*Each dot is a model's mean over the test slices, overall (left of the divider) and per patient; the bars span ±1 SD.*
+
+- **Every model clears the fidelity criterion (SSIM > 0.6) by a wide margin.** Even the baseline's worst test slice scores 0.900.
+- **VQ-VAE-2 reconstructs better than the baseline on every test patient.** Overall it gains 0.012 SSIM and 1.0 dB PSNR. The gap is about one SD, so the two spreads overlap, but the order holds for all three patients. VQ-VAE-2 also has twice the stage-1 parameters (1.71M against 0.82M), so part of the gain may come from capacity rather than from the second level.
+- **Inception features agree.** VQ-VAE-2's reconstructions score an FID of 78.2 against the training slices, against 87.6 for the baseline's. The real test slices score 62.6.
+- **The SSIM loss adds a further 0.012 SSIM and 0.4 dB.** It also spreads the bottom level over more of its codebook (perplexity 287 against 260).
+- **No codebook collapsed onto a few codes,** the risk named in the feasibility review. Perplexity stays between 255 and 391 of 512 at every level.
+
+<img src="assets/results/reconstructions_vqvae2.png" width="100%">
+
+*VQ-VAE-2 on six test slices: the original, the top level decoded alone (bottom codes set to zero), the full reconstruction and its absolute error.*
+
+<img src="assets/results/reconstructions_baseline.png" width="75%">
+
+*The baseline on the same six slices. Each error map's colour scale stops at that figure's 99.5th-percentile error, about 0.11 for VQ-VAE-2 and 0.13 for the baseline, so compare the two by their colour bars.*
+
+- **The errors sit on fine structure.** In both models, they concentrate on tissue edges and the textured centre of the pelvis, such as the bowel loops and the bladder wall. The background and flat muscle are almost error-free. The reconstructions lose some fine texture, not anatomy.
+- **The top level alone reconstructs almost nothing** (SSIM 0.22, a near-black frame), so the decoder draws nearly all of its content from the bottom codes. Zeroed bottom codes are an input the decoder never saw in training, so this understates what the top level holds. Its main role shows up in sampling instead: the bottom prior is conditioned on the top codes, which is why $T_\text{top}$ changes the layout of samples in the separate-temperature sweeps below.
+
+### Latent interpolation
+Interpolation tests whether the latent space is continuous. Each model was given the same four pairs of test slices, taken from different patients at the same slice index. For each pair, the two slices' encoder outputs are blended before quantisation, $(1 - a)\,z_A + a\,z_B$, for nine values of $a$ from 0 to 1. Each blend is then quantised and decoded.
+
+Smoothness is measured as the change between consecutive frames, 1 − SSIM. A jump would show as one step much larger than the rest, so each path is scored by its largest step divided by its median step.
+
+| Model | Largest / median step (mean ± SD over 4 pairs) | Worst pair |
+|---|---|---|
+| Baseline (1 level) | 1.14 ± 0.04 | 1.19 |
+| VQ-VAE-2 | 1.18 ± 0.10 | 1.31 |
+
+*A ratio of 1 means every step in the path is the same size.*
+
+<img src="assets/results/interpolation_vqvae2.png" width="100%">
+
+*VQ-VAE-2 interpolations between four pairs of test slices, labelled by the two patients and the slice index, with the blend weight $a$ above each column.*
+
+<img src="assets/results/interpolation_baseline.png" width="100%">
+
+*The baseline's interpolations between the same four pairs.*
+
+<img src="assets/results/interpolation_steps_baseline.png" width="49%"> <img src="assets/results/interpolation_steps_vqvae2.png" width="49%">
+
+*The change between consecutive frames along each path, for the baseline (left) and VQ-VAE-2 (right).*
+
+- **Neither model jumps.** In both grids, each frame differs only slightly from the one before it, and no frame suddenly switches from one slice to the other. Every step changes the frame by 0.05–0.09 (1 − SSIM), and no step is more than 1.31 times its path's median. The interpolation part of the diversity criterion is met.
+- **The two models behave alike.** The baseline's frames look almost the same as VQ-VAE-2's. Both have their largest step in the same place, the last step of the 040/041 pair (0.091). That step reflects the pair rather than either model.
+
+
+### Shared sampling temperature
+Every sampling setting in this and the following sections draws 512 samples from the same seed. Two measures are used throughout:
 
 - **FID** against the 11,460 training slices, where lower is more realistic. Real slices from the three unseen test patients score 62.6, roughly where a generator of genuinely new patients would sit.
 - **The nearest-neighbour audit.** For each sample, this is the SSIM to its most similar training slice. The reference is the same measure for the test patients' slices, passed through the same decoder so that its blur affects both sides equally. A sample is **flagged** when it is closer to a training slice than any test slice gets (the reference maximum, 0.435–0.439 depending on the model). A flagged sample is closer to the training data than a new patient's scan is, which is the signature of memorisation.
 
-### Shared sampling temperature
 Each model was first sampled with one temperature, $T$, shared by all of its priors. Three models are compared: the single-level baseline, VQ-VAE-2, and VQ-VAE-2 trained with an extra SSIM term in its reconstruction loss (weight 0.01).
 
 | Model | $T = 0.8$ | $T = 0.9$ | $T = 1.0$ |
@@ -169,6 +231,8 @@ Even the closest samples at this setting stop at the reference maximum (SSIM 0.4
 - **Code agreement.** The code-level audit does not fully clear this setting.
   - No sample shares more than 17.8% of its top codes, or 24.1% of its bottom codes, with any training slice. That is far from a copy.
   - Both figures are still above the test patients' 10.2% and 16.2%, so at the code level the samples sit closer to the training data than new patients do.
+
+
 
 ## AI Usage Disclosure
 [placeholder]
