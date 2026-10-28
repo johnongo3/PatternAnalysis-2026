@@ -90,8 +90,6 @@ The data are the 2D slices of the HipMRI study (Dowling & Greer, 2021): weekly M
 3. **Normalise per slice.** MR intensities have no fixed scale between scans. Each slice is clipped at its own 99.5th percentile, so a few very bright pixels do not compress the rest, then min-max scaled to [0, 1].
 4. **Cache.** Each preprocessed split is saved as one tensor file (about 1.5 GB for the training split) and reloaded on later runs. The cache is rebuilt if the files, the size or the clip percentile change.
 
-No augmentation is used. The arrays are stored with superior along the columns, and every figure rotates them upright.
-
 <img src="assets/slices_train.png" width="100%">
 
 *Sixteen random training slices after preprocessing, labelled by patient (case), week and slice index.*
@@ -111,11 +109,11 @@ Both models are trained by `train.py` in three steps, with the settings in `conf
 
 $$\mathcal{L} = \lVert x - \hat{x} \rVert_2^2 + \beta \sum_\text{levels} \lVert z - \mathrm{sg}[e] \rVert_2^2 + w\bigl(1 - \mathrm{SSIM}(x, \hat{x})\bigr), \qquad \beta = 0.25,$$
 
-with $w = 0$ for VQ-VAE-2 and the baseline, and $w = 0.01$ for the SSIM-loss variant. The codebooks get no gradient. Each code follows an exponential moving average (decay 0.99) of the encoder outputs assigned to it, and a code used less than about once per batch is restarted at a random encoder output. After every epoch, the model is scored on the validation slices. The checkpoint with the highest validation SSIM is kept, and training stops after 10 epochs without a gain of at least $10^{-4}$.
+with $w = 0$ for VQ-VAE-2 and the baseline, and $w = 0.01$ for the SSIM-loss variant. The codebooks get no gradient. Each code follows an exponential moving average (decay 0.99) of the encoder outputs assigned to it, and a code used less than about once per batch is restarted at a random encoder output. Training is stopped early on validation SSIM, as described under Early stopping below.
 
 **Encoding.** The kept stage-1 checkpoint is frozen and turns every slice into code maps: 32×16 top and 64×32 bottom codes for VQ-VAE-2, and a single 64×32 map for the baseline.
 
-**Stage 2: the priors.** Each prior learns to predict every code from the codes before it in raster order, by cross-entropy on the true code maps (teacher forcing). The top prior and the baseline's single prior are unconditional, and the bottom prior also sees the true top codes. Each is trained by Adam (learning rate $3 \times 10^{-4}$, batch 32) with dropout 0.3. The checkpoint with the lowest validation negative log-likelihood (NLL, in bits per code) is kept, and training stops after 10 epochs without a fall of at least $10^{-3}$ bits.
+**Stage 2: the priors.** Each prior learns to predict every code from the codes before it in raster order, by cross-entropy on the true code maps (teacher forcing). The top prior and the baseline's single prior are unconditional, and the bottom prior also sees the true top codes. Each is trained by Adam (learning rate $3 \times 10^{-4}$, batch 32) with dropout 0.3. Training is stopped early on the validation negative log-likelihood (NLL, in bits per code).
 
 ```bash
 python train.py                          # stage 1, VQ-VAE-2
@@ -153,7 +151,6 @@ Each pipeline trains in about 40–45 minutes, most of it spent on the priors.
 - **Code use rises, then narrows, without collapsing.** In both models, bottom perplexity peaks above 400 around epoch 5, then falls slowly to 265–300 of 512. VQ-VAE-2's top perplexity is noisier and peaks later, near 480 at epoch 29.
 - **The top level alone stays weak.** Decoded on its own, it rises only from 0.12 to about 0.2 validation SSIM over training. This is the near-black top-only reconstruction shown in the Results.
 - **The commitment loss rises steadily after the first few epochs** in both models, meaning the encoder outputs drift further from their nearest codes as training goes on. The reconstruction loss still falls over the same epochs.
-- **The baseline's checkpoint is from epoch 38, not the epoch 45 marked.** The plot marks the highest validation SSIM, but a new checkpoint replaces the kept one only when it gains at least $10^{-4}$, and no later epoch beat epoch 38 by that much.
 
 ### Prior curves
 <img src="assets/results/prior_nll_vqvae2.png" width="66%"> <img src="assets/results/prior_nll_baseline.png" width="33%">
@@ -161,8 +158,12 @@ Each pipeline trains in about 40–45 minutes, most of it spent on the priors.
 *Training and validation NLL in bits per code for VQ-VAE-2's top and bottom priors (left) and the baseline's single prior (right). The baseline's prior models its only level, a 64×32 map, so its plot is titled "Bottom prior". The dotted line marks the lowest validation NLL, which is the kept checkpoint. A uniform guess over 512 codes costs 9 bits.*
 
 - **Every prior overfits within six epochs.** Validation NLL is lowest at epoch 5 or 6: 7.47 bits per code for the top prior, 5.15 for the bottom prior and 5.34 for the baseline's. After that, it rises while the training NLL keeps falling. By the last epoch, the top prior's gap is 2.2 bits (6.1 against 8.3).
-- **Early stopping catches this, as the feasibility review planned.** A rising validation NLL was the warning sign it named for memorisation. Each prior keeps its epoch-5 or epoch-6 checkpoint, and training stops 10 epochs later. With about 52M parameters each and only 11,460 training code maps, the priors overfit quickly despite a dropout of 0.3. Early stopping limits this but cannot rule out memorisation, which is why the samples are audited in the Results.
 - **Top codes are harder to predict.** Each costs 7.47 bits, only 1.5 below a uniform guess, against 5.15 for a bottom code. A top code covers an 8×8 patch of the slice rather than 4×4, and the bottom prior has the top codes to guide it.
+
+### Early stopping
+Every training stage uses the same rule, in `fit` in `train.py`. After each epoch, the model is scored on the whole validation split. If the monitored metric beats the best so far by more than a threshold, the model is saved as the kept checkpoint and a counter resets. Otherwise the counter goes up, and training stops when it reaches 10 epochs (the patience). Stage 1 monitors validation SSIM with a threshold of $10^{-4}$, and the priors monitor validation NLL with a threshold of $10^{-3}$ bits per code. A second checkpoint, saved every epoch with the counter, lets an interrupted run resume where it left off. No run came near the 100-epoch cap.
+
+For the priors, it is the main guard against overfitting. With about 52M parameters each and only 11,460 training code maps, the priors overfit within six epochs despite a dropout of 0.3. Their validation NLL rose in every epoch after the best one, so each kept its epoch-5 or epoch-6 checkpoint. This is the mitigation the feasibility review planned for its memorisation warning sign, a rising validation NLL. It limits memorisation but cannot rule it out, so the samples are audited in the Results.
 
 ## Results
 Stage 1 comes first: how well each model reconstructs patients it never saw. The samples from stage 2 follow, judged on realism and memorisation, and the section ends with latent interpolations.
