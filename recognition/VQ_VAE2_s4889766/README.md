@@ -111,21 +111,21 @@ python scripts/check_priors.py        # causality and conditioning checks for th
 
 ```bash
 # 1. Train each model: stage 1, then its priors. These jobs run one at a time.
-sbatch jobs/train.sh                          # VQ-VAE-2
-sbatch jobs/train.sh --levels 1               # baseline
-sbatch jobs/train.sh --ssim-loss-weight 0.01  # SSIM-loss variant
+sbatch scripts/train.sh                          # VQ-VAE-2
+sbatch scripts/train.sh --levels 1               # baseline
+sbatch scripts/train.sh --ssim-loss-weight 0.01  # SSIM-loss variant
 
 # 2. Once training has finished, evaluate each run. Jobs that share a -J name run in turn.
-sbatch -J eval_L2 jobs/evaluate.sh checkpoints/vqvae2_L2_ssim0 --temperatures 0.6 0.7 0.8 0.9 1.0
-sbatch -J eval_L1 jobs/evaluate.sh checkpoints/vqvae2_L1_ssim0 --temperatures 0.6 0.7 0.8 0.9 1.0
-sbatch -J eval_ssim jobs/evaluate.sh checkpoints/vqvae2_L2_ssim0.01
-sbatch -J eval_ssim jobs/evaluate.sh checkpoints/vqvae2_L2_ssim0.01 \
+sbatch -J eval_L2 scripts/evaluate.sh checkpoints/vqvae2_L2_ssim0 --temperatures 0.6 0.7 0.8 0.9 1.0
+sbatch -J eval_L1 scripts/evaluate.sh checkpoints/vqvae2_L1_ssim0 --temperatures 0.6 0.7 0.8 0.9 1.0
+sbatch -J eval_ssim scripts/evaluate.sh checkpoints/vqvae2_L2_ssim0.01
+sbatch -J eval_ssim scripts/evaluate.sh checkpoints/vqvae2_L2_ssim0.01 \
     --temperatures 0.7 0.8 0.9 --bottom-temperatures 0.7 0.8 0.9
-sbatch -J eval_ssim jobs/evaluate.sh checkpoints/vqvae2_L2_ssim0.01 \
+sbatch -J eval_ssim scripts/evaluate.sh checkpoints/vqvae2_L2_ssim0.01 \
     --temperatures 0.9 1.0 1.1 --bottom-temperatures 0.5 0.6 0.7
 
 # 3. Once every evaluation has finished: failure autopsy, resource use, results tables and plots.
-sbatch jobs/report.sh
+sbatch scripts/report.sh
 ```
 
 Each stage-1 run is saved to `checkpoints/vqvae2_L<levels>_ssim<weight>/`, with its code maps and priors inside it (Section 5 explains each training step). `jobs/evaluate.sh` runs `predict.py all` on one run: reconstruct, sample, audit, fid and interpolate. Each task writes its numbers to `<run>/eval/<task>.json` and its figures to `assets/`. Jobs on the same run share a `-J` name so that they never write its results at the same time. Sampling skips settings that are already saved, so an evaluation that hits its 8-hour limit can be resubmitted and carries on. `jobs/report.sh` writes `assets/results.md`, which the comparison plots in `assets/results/` are drawn from. Outside Rangpur, run the `python` lines of each script directly.
