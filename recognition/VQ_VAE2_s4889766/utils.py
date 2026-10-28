@@ -28,7 +28,7 @@ from scipy import linalg
 from torchmetrics.functional.image import (peak_signal_noise_ratio,
                                            structural_similarity_index_measure)
 
-from dataset import to_display
+from dataset import MASK_LABELS, to_display
 from modules import PixelCNNPrior, VQVAE2, build_prior, build_vqvae
 
 
@@ -345,8 +345,8 @@ def plot_prior_history(histories: dict[str, list[dict]], path: str):
     plt.close(fig)
 
 
-def plot_samples(samples: dict[float, torch.Tensor], path: str):
-    """Grid of generated slices, one row per sampling temperature."""
+def plot_samples(samples: dict[str, torch.Tensor], path: str):
+    """Grid of generated slices, one row per temperature key ('0.8' or top/bottom '0.9/0.7')."""
     temperatures = list(samples)
     n = len(samples[temperatures[0]])
     fig, axes = plt.subplots(len(temperatures), n, figsize=(2.6 * n, 1.5 * len(temperatures)),
@@ -357,7 +357,7 @@ def plot_samples(samples: dict[float, torch.Tensor], path: str):
             ax.imshow(to_display(samples[t][col].cpu()), cmap="gray", vmin=0, vmax=1)
             ax.set_xticks([])
             ax.set_yticks([])
-        axes[row, 0].set_ylabel(f"T = {t:g}")
+        axes[row, 0].set_ylabel(f"T = {t}")
     fig.savefig(path, dpi=100, bbox_inches="tight")
     plt.close(fig)
 
@@ -398,6 +398,68 @@ def plot_nn_pairs(queries: torch.Tensor, neighbours: torch.Tensor, captions: lis
         axes[0, col].set_title(captions[col], fontsize=8)
     axes[0, 0].set_ylabel("sample")
     axes[1, 0].set_ylabel("nearest train")
+    fig.savefig(path, dpi=100, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_candidates(images: torch.Tensor, captions: list[str], path: str, per_row: int = 6):
+    """Generated slices in a grid, each titled with its caption (e.g. its sample index)."""
+    rows = math.ceil(len(images) / per_row)
+    fig, axes = plt.subplots(rows, per_row, figsize=(2.6 * per_row, 1.6 * rows), squeeze=False,
+                             layout="constrained")
+    for ax in axes.flat:
+        ax.axis("off")
+    for ax, image, caption in zip(axes.flat, images, captions):
+        ax.imshow(to_display(image.float()), cmap="gray", vmin=0, vmax=1)
+        ax.set_title(caption, fontsize=8)
+    fig.savefig(path, dpi=100, bbox_inches="tight")
+    plt.close(fig)
+
+
+# Outline colour and line style per mask label. Body is left out: its margin
+# already shows in the image. Three hues that stay distinct under colour-vision
+# deficiency, with prostate dashed so it is not told from rectum by colour alone.
+OUTLINES = {2: ("#3987e5", "solid"), 3: ("#d95926", "solid"), 4: ("#199e70", "solid"),
+            5: ("#199e70", "dashed")}
+
+
+def plot_autopsy(columns: dict[str, torch.Tensor], masks: np.ndarray, captions: list[str],
+                 outlined: tuple[str, ...], path: str):
+    """
+    One row per sample and one column per entry of columns, each (N, 1, H, W).
+    Columns named in outlined get the structures of the matching mask (N, H, W)
+    outlined over them. Columns whose name starts with "|" are error maps, drawn
+    in grey (not inferno) so the coloured outlines stay visible on them.
+    """
+    names = list(columns)
+    n = len(captions)
+    fig, axes = plt.subplots(n, len(names), figsize=(2.6 * len(names), 1.5 * n), squeeze=False,
+                             layout="constrained")
+    for col, name in enumerate(names):
+        images = columns[name].detach().cpu().float()
+        is_error = name.startswith("|")
+        vmax = float(images.quantile(0.995)) if is_error else 1.0
+        for row in range(n):
+            ax = axes[row, col]
+            im = ax.imshow(to_display(images[row]), cmap="gray", vmin=0, vmax=vmax)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            if name in outlined:
+                mask = to_display(masks[row])
+                for label, (colour, style) in OUTLINES.items():
+                    if (mask == label).any():
+                        ax.contour((mask == label).astype(float), levels=[0.5], colors=colour,
+                                   linestyles=style, linewidths=1.0)
+            if row == 0:
+                ax.set_title(name, fontsize=9)
+            if col == 0:
+                ax.set_ylabel(captions[row], fontsize=7)
+        if is_error:
+            fig.colorbar(im, ax=axes[:, col].tolist(), shrink=0.6)
+    handles = [plt.Line2D([], [], color=colour, linestyle=style, label=MASK_LABELS[label])
+               for label, (colour, style) in OUTLINES.items()]
+    fig.legend(handles=handles, loc="lower center", bbox_to_anchor=(0.5, 1.0), ncol=len(handles),
+               fontsize=8, frameon=False, title="nearest training slice's mask", title_fontsize=8)
     fig.savefig(path, dpi=100, bbox_inches="tight")
     plt.close(fig)
 
