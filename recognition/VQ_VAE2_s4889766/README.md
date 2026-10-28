@@ -13,7 +13,7 @@
 
 ## Dataset and Preprocessing
 
-## Training Procedure
+## Training
 [placeholder]
 
 ### Loss Function
@@ -23,7 +23,7 @@
 Stage 1 comes first: how well each model reconstructs patients it never saw. The samples from stage 2 follow, judged on realism and memorisation, and the section ends with latent interpolations.
 
 ### Reconstruction
-Each model reconstructed the 540 slices of the three test patients.
+Each model reconstructed the 540 slices of the three test patients. Reconstructions are scored against the originals by SSIM (Wang et al., 2004) and PSNR.
 
 | Model | SSIM | PSNR (dB) | Top-only SSIM | Codebook perplexity (top / bottom) |
 |---|---|---|---|---|
@@ -39,7 +39,7 @@ Each model reconstructed the 540 slices of the three test patients.
 
 - **Every model clears the fidelity criterion (SSIM > 0.6) by a wide margin.** Even the baseline's worst test slice scores 0.900.
 - **VQ-VAE-2 reconstructs better than the baseline on every test patient.** Overall it gains 0.012 SSIM and 1.0 dB PSNR. The gap is about one SD, so the two spreads overlap, but the order holds for all three patients. VQ-VAE-2 also has twice the stage-1 parameters (1.71M against 0.82M), so part of the gain may come from capacity rather than from the second level.
-- **Inception features agree.** VQ-VAE-2's reconstructions score an FID of 78.2 against the training slices, against 87.6 for the baseline's. The real test slices score 62.6.
+- **Inception features agree.** FID compares Inception-v3 features (Szegedy et al., 2016) of two image sets. VQ-VAE-2's reconstructions score an FID of 78.2 against the training slices, against 87.6 for the baseline's. The real test slices score 62.6.
 - **The SSIM loss adds a further 0.012 SSIM and 0.4 dB.** It also spreads the bottom level over more of its codebook (perplexity 287 against 260).
 - **No codebook collapsed onto a few codes,** the risk named in the feasibility review. Perplexity stays between 255 and 391 of 512 at every level.
 
@@ -122,7 +122,7 @@ At a lower temperature, the priors favour their most likely codes, and those are
 
 <img src="assets/results/tsne_baseline.png" width="49%"> <img src="assets/results/tsne_vqvae2.png" width="49%">
 
-*t-SNE of Inception features for the training slices (grey), the test slices (orange) and the samples at each temperature, for the baseline (left) and VQ-VAE-2 (right).*
+*t-SNE (van der Maaten & Hinton, 2008) of Inception features for the training slices (grey), the test slices (orange) and the samples at each temperature, for the baseline (left) and VQ-VAE-2 (right).*
 
 - **No sample lands on a training slice.** In both models, the samples form their own cloud beside the real slices. A memorising model would instead place samples on top of individual training points.
 - **The gap between the clouds is the realism gap that FID measures.** Inception features still separate generated slices from real ones. The test slices, in contrast, sit along the edge of the training cloud in short streaks, likely runs of neighbouring slices from one patient.
@@ -254,9 +254,63 @@ The audits above look at the samples closest to the training set. The autopsy lo
 - **The failure starts in the top codes.** With the same top codes, $T_\text{bottom} = 0.6$ and $0.7$ also give over-bright, broken slices (mean 0.40–0.53, still above every training slice). The body outline stays about the same, and only the interior detail changes, never into coherent anatomy. A colder bottom prior cannot rescue a bad top map. Whether the hot $T_\text{top}$ of 1.1 causes these failures needs the same autopsy at a cooler setting, such as 0.9/0.5.
 - **At least 13 of the 512 samples (2.5%) fail this way.** This is a lower bound, since only the 16 lowest were inspected. Because these samples are brighter than any training slice, a simple check against the brightest training slice would catch most of them before samples are shared.
 
+## Conclusion
+Unless stated otherwise, the answers below refer to the SSIM-loss VQ-VAE-2 sampled at the recommended setting, $T_\text{top} = 1.1$ and $T_\text{bottom} = 0.5$.
+
+### Against the Acceptance Criteria
+
+| Criterion | Target | Result | Met |
+|---|---|---|---|
+| Fidelity | Test reconstruction SSIM > 0.6 | 0.953 ± 0.009, against 0.929 ± 0.012 for the baseline | Yes |
+| Realism | FID below the baseline's | 77.9, against 138.1 for the baseline at its best | Yes |
+| No memorisation | No sample with a high SSIM to a training slice | No sample is closer to a training slice than a test slice gets. The closest scores 0.435, against about 0.95 for a copy. No sample copies a training slice's codes. | Yes, at the image level |
+| Diversity | No mode collapse, and no jumps in interpolations | No collapse in the t-SNE or the uncurated grids. No interpolation step exceeds 1.31 times its path's median. | Yes |
+
+### Answering the research question
+- No sample at the recommended setting is closer to a training slice than an unseen patient's slice is.
+- No sample in any of the 28 settings audited, across all three models, copies a training slice's codes exactly.
+- The typical sample is as far from the training set as a new patient: its median nearest-train SSIM is 0.310, against 0.321.
+- The novelty is not complete. At the code level the samples sit closer to the training data than new patients do: they share up to 17.8% of top and 24.1% of bottom codes with a training slice, against 10.2% and 16.2% for new patients. The closest samples also keep tracing back to the same two training patients, 026 and 027.
+
+**Diverse: yes, with no sign of mode collapse.**
+- At every shared temperature, the samples spread through their own region of the t-SNE rather than gathering into tight clusters.
+- Each level of the codebook uses 255–391 of its 512 codes effectively.
+- Interpolations between patients change smoothly, without jumps.
+- At the recommended setting itself, the evidence for diversity is the uncurated grid and the audit, not a separate t-SNE. Its hot top temperature is the setting that pushes layouts furthest from the training set.
+
+**Anatomically coherent: mostly, but not reliably.**
+- Most uncurated samples show a recognisable pelvis, often with a bladder and femoral heads.
+- At least 13 of the 512 samples (2.5%) are broken: brighter than any training slice and without coherent organs.
+- An FID of 77.9 against 62.6 for real slices means Inception features can still tell samples from real scans. The plain VQ-VAE-2's own reconstructions score 78.2, which suggests the decoder's loss of fine texture is now a large part of the remaining gap.
+- Anatomy was judged only by eye. There is no expert review and no measurement of organ shape or position.
+
+**Compared with the single-level baseline:**
+- **Fidelity:** both pass SSIM > 0.6 easily. VQ-VAE-2 is better on every test patient, and the SSIM loss widens the gap to 0.024 SSIM and 1.4 dB. VQ-VAE-2 also has twice the stage-1 parameters, so part of the gain may come from capacity.
+- **Realism and coverage:** VQ-VAE-2 reaches an FID of 77.9 against the baseline's 138.1.
+  - Even with one shared temperature, both two-level models do better: 120.1 with the SSIM loss and 130.0 without.
+  - Separate temperatures need two priors, so part of the gain comes from the architecture itself.
+  - The comparison does favour VQ-VAE-2 somewhat. It was tuned over 18 settings against the baseline's 5, and its best setting was chosen on the same samples it is reported with.
+  - FID combines realism and coverage in one number. Separating them, for example with precision and recall (Kynkäänniemi et al., 2019), was not done.
+- **Memorisation:** the baseline flags only 1–3 samples at each of its five temperatures. At the code level, though, it is the closer model: its samples share up to 36.0% of their codes with a training slice, against at most 31.8% for any VQ-VAE-2 sample at the same code-map size. At the recommended setting, VQ-VAE-2 flags none.
+
+### Verdict
+**Non-memorised: Yes, on every test run.** No sample copies a training slice at the image or code level. None is flagged at the recommended setting, and the typical sample is as novel as a new patient. Two loose ends remain: the code agreement above that of new patients, and the recurring patients 026 and 027, which a patient-level audit should check.
+
+**Clinically plausible for downstream training: No.**
+- **Broken samples:** at least 2.5% are broken and must be filtered out first. A brightness check catches most of them.
+- **Realism gap:** the gap to real scans remains with FID 77.9 against FID 62.6 for test slices.
+- **No labels:** the model generates images without segmentation masks, so it cannot supply labelled data for a segmentation task on its own.
+
+**Overall:** VQ-VAE-2 answers the research question positively on novelty, diversity and fidelity, and beats the single-level baseline on fidelity and realism. The generated cohort is a non-memorised starting point but not yet a validated, or viable, substitute for real scans.
 
 ## AI Usage Disclosure
 [placeholder]
+
+## References
+- Dowling, J., & Greer, P. (2021). *Labelled weekly MR images of the male pelvis* [Data set]. CSIRO. https://doi.org/10.25919/45t8-p065
+- Razavi, A., van den Oord, A., & Vinyals, O. (2019). Generating diverse high-fidelity images with VQ-VAE-2. In *Advances in Neural Information Processing Systems 32*. https://arxiv.org/abs/1906.00446
+- van den Oord, A., Kalchbrenner, N., Vinyals, O., Espeholt, L., Graves, A., & Kavukcuoglu, K. (2016). Conditional image generation with PixelCNN decoders. In *Advances in Neural Information Processing Systems 29*. https://arxiv.org/abs/1606.05328
+- van den Oord, A., Vinyals, O., & Kavukcuoglu, K. (2017). Neural discrete representation learning. In *Advances in Neural Information Processing Systems 30*. https://arxiv.org/abs/1711.00937
 
 
 ## Feasibility Review
@@ -288,9 +342,9 @@ An MRI slice has both a global layout (the outline of the body and the organs) a
 ### Preliminary Evidence of Feasibility
 <img src="assets/feasibility_recon.png" width="80%">
 
-- **Data audit:** 12,660 slices from 38 patients, split by patient (train 11,460 / 31 patients, validate 660 / 4 patients, test 540 / 3 patients).
+- **Data audit:** 12,660 slices from 38 patients in the HipMRI study (Dowling & Greer, 2021), split by patient (train 11,460 / 31 patients, validate 660 / 4 patients, test 540 / 3 patients).
 - **Stage-1 test** (validation): after 6 minutes on an A100, SSIM 0.932 $\pm$ 0.011 and PSNR 31.6 dB.
-- **Priors:** ~52 M parameter PixelCNN used, which samples at around 3s per image.
+- **Priors:** ~52 M parameter gated PixelCNN (van den Oord et al., 2016) used, which samples at around 3s per image.
 
 ### Risks, Budget & Fallback
 | Risk | Warning sign | Mitigation |
