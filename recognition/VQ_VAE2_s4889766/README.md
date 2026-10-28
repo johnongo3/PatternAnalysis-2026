@@ -191,8 +191,8 @@ python train.py --ssim-loss-weight 0.01  # stage 1, SSIM-loss variant; its prior
 | VQ-VAE-2 | Stage 1 | 1.71M | 51 (41) | 0.10 | 1.6 |
 | VQ-VAE-2 | Top prior | 52.39M | 15 (5) | 0.15 | 3.1 |
 | VQ-VAE-2 | Bottom prior | 51.80M | 16 (6) | 0.49 | 8.0 |
-| Baseline (1 level) | Stage 1 | 0.82M | 48 (38) | 0.07 | 1.3 |
-| Baseline (1 level) | Prior | 52.78M | 15 (5) | 0.61 | 9.9 |
+| VQ-VAE | Stage 1 | 0.82M | 48 (38) | 0.07 | 1.3 |
+| VQ-VAE | Prior | 52.78M | 15 (5) | 0.61 | 9.9 |
 
 *Training cost of the plain VQ-VAE-2 and the baseline on the A100.*
 
@@ -236,7 +236,7 @@ Each model reconstructed the 540 slices of the three test patients. Reconstructi
 
 | Model | SSIM | PSNR (dB) | Top-only SSIM | Codebook perplexity (top / bottom) |
 |---|---|---|---|---|
-| Baseline (1 level) | 0.929 ± 0.012 | 31.13 ± 1.53 | – | – / 255 |
+| VQ-VAE | 0.929 ± 0.012 | 31.13 ± 1.53 | – | – / 255 |
 | VQ-VAE-2 | 0.941 ± 0.009 | 32.13 ± 1.54 | 0.224 ± 0.047 | 383 / 260 |
 | VQ-VAE-2 + SSIM loss | **0.953 ± 0.009** | **32.49 ± 1.58** | 0.226 ± 0.048 | 391 / 287 |
 
@@ -270,7 +270,7 @@ Smoothness is measured as the change between consecutive frames, 1 − SSIM. A j
 
 | Model | Largest / median step (mean ± SD over 4 pairs) | Worst pair |
 |---|---|---|
-| Baseline (1 level) | 1.14 ± 0.04 | 1.19 |
+| VQ-VAE | 1.14 ± 0.04 | 1.19 |
 | VQ-VAE-2 | 1.18 ± 0.10 | 1.31 |
 
 *A ratio of 1 means every step in the path is the same size.*
@@ -301,7 +301,7 @@ Each model was first sampled with one temperature, $T$, shared by all of its pri
 
 | Model | $T = 0.8$ | $T = 0.9$ | $T = 1.0$ |
 |---|---|---|---|
-| Baseline (1 level) | 150.1 | **138.1** | 161.4 |
+| VQ-VAE | 150.1 | **138.1** | 161.4 |
 | VQ-VAE-2 | **130.0** | 147.7 | 186.1 |
 | VQ-VAE-2 + SSIM loss | **120.1** | 129.5 | 159.0 |
 
