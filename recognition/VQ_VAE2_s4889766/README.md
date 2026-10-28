@@ -5,7 +5,13 @@
 **Difficulty:** Hard
 
 ## VQ-VAE2 Architecture
-[placeholder]
+<img src="assets/architecture.png" width="100%">
+
+*The two stages of VQ-VAE-2 as implemented in `modules.py`.*
+
+VQ-VAE-2 (Razavi et al., 2019) generates images in two stages. In stage 1 (top half of the figure), a hierarchical autoencoder turns each 256×128 slice into two grids of discrete codes. The bottom encoder downsamples the slice 4× with strided convolutions and residual blocks, and the top encoder downsamples it a further 2×. Each level then replaces every latent vector with the nearest of its 512 learned 64-dimensional codes. This gives a 32×16 top code map for the global layout and a 64×32 bottom code map for local detail. The bottom level is quantised only after it sees the decoded top codes, so it can focus on what the top level misses. The decoder upsamples the top codes, concatenates them with the bottom codes and reconstructs the slice. Gradients pass the nearest-code lookup by the straight-through estimator, and the codebooks are updated by moving averages rather than by gradient (see Training). Setting `levels: 1` removes the top level, which gives the single-level baseline.
+
+Stage 2 (bottom half) learns which code maps are likely, using gated PixelCNN priors (van den Oord et al., 2016) that predict each code from the codes before it in raster order. The top prior has 12 masked-convolution layers (kernel 5, 256 channels) with causal self-attention after every fourth layer, so each code can attend to the whole layout drawn so far. The bottom prior has 10 layers and no attention, which would be costly in memory over 2,048 positions. Instead, it receives the top codes through a conditioning stack of 8 residual blocks and a 2× upsample, added to every layer. To generate a slice, the top prior draws 512 codes one at a time, the bottom prior draws 2,048 codes given them, and the frozen stage-1 decoder turns both maps into an image. Before each draw, the logits are divided by a temperature $T$, which trades realism against variety. The baseline's single prior has the same design as the top prior, applied to its 64×32 map. Each prior has about 52M parameters, against 1.71M for the stage-1 model.
 
 
 ## Dependencies & Usage
