@@ -6,10 +6,13 @@ Usage, where RUN is a stage-1 run directory such as checkpoints/vqvae2_L2_ssim0:
     python predict.py reconstruct RUN   test SSIM and PSNR (mean ± SD, per patient)
                                         and codebook perplexity per level
     python predict.py sample RUN        timed sampling with the priors, per temperature
+                                        (--bottom-temperatures sweeps the priors separately)
     python predict.py audit RUN         nearest-neighbour and code-copy memorisation checks
     python predict.py fid RUN           FID against the training slices, t-SNE of features
     python predict.py interpolate RUN   latent interpolations between test slices
     python predict.py all RUN           the five tasks above, in order
+    python predict.py autopsy RUN       flawed samples at one --setting beside their nearest
+                                        training slice and its segmentation mask
     python predict.py resources RUN...  parameters, training time, peak VRAM, sampling time
     python predict.py report RUN...     markdown tables comparing runs, from their results
 
@@ -30,14 +33,14 @@ from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 from torch.utils.data import DataLoader
 
-from dataset import CodeDataset, HipMRISlices, build_datasets
+from dataset import MASK_LABELS, CodeDataset, HipMRISlices, build_datasets, load_mask
 from modules import VQVAE2, BottomPrior, build_prior, build_vqvae
 from utils import (code_usage, codes_dir, frechet_distance, inception_features, load_checkpoint,
                    load_prior, load_vqvae, max_code_agreement, nearest_by_ssim, pick_device,
-                   plot_embedding, plot_interpolations, plot_nn_histogram, plot_nn_pairs,
-                   plot_prior_history, plot_reconstructions, plot_samples, plot_step_changes,
-                   plot_vqvae_history, prior_dir, psnr, read_history, save_atomic, ssim,
-                   summarise, summarise_by_group, synchronize)
+                   plot_autopsy, plot_candidates, plot_embedding, plot_interpolations,
+                   plot_nn_histogram, plot_nn_pairs, plot_prior_history, plot_reconstructions,
+                   plot_samples, plot_step_changes, plot_vqvae_history, prior_dir, psnr,
+                   read_history, save_atomic, ssim, summarise, summarise_by_group, synchronize)
 
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 TASKS = ("reconstruct", "sample", "audit", "fid", "interpolate")
@@ -50,7 +53,10 @@ def run_name(run_dir: str) -> str:
 
 
 def model_label(cfg: dict) -> str:
-    return "VQ-VAE-2 (2 levels)" if cfg["vqvae"]["levels"] == 2 else "Baseline (1 level)"
+    """The model's name in results and tables, with the SSIM loss weight when it is used."""
+    label = "VQ-VAE-2 (2 levels)" if cfg["vqvae"]["levels"] == 2 else "Baseline (1 level)"
+    weight = cfg["vqvae"].get("ssim_loss_weight", 0)
+    return f"{label}, SSIM loss {weight:g}" if weight else label
 
 
 def figure_path(args, name: str) -> str:
@@ -77,15 +83,40 @@ def load_split(args, cfg: dict, split: str) -> HipMRISlices:
                         cfg["data"]["clip_percentile"])
 
 
-def load_samples(run_dir: str) -> dict[float, dict]:
-    """Saved samples per temperature, as written by the sample task."""
+def temperature_key(temperature: dict[str, float]) -> str:
+    """
+    Name of a sampling setting, given each level's temperature: '0.8' when every
+    level samples at 0.8 (the form older results use), else 'top/bottom', e.g. '0.9/0.7'.
+    """
+    values = set(temperature.values())
+    if len(values) == 1:
+        return f"{values.pop():g}"
+    return f"{temperature['top']:g}/{temperature['bottom']:g}"
+
+
+def key_order(key: str) -> tuple[float, float]:
+    """Sort temperature keys by top, then bottom temperature."""
+    parts = [float(p) for p in key.split("/")]
+    return parts[0], parts[-1]
+
+
+def file_tag(key: str) -> str:
+    """A temperature key made safe for file names: '0.9/0.7' becomes '0.9_0.7'."""
+    return key.replace("/", "_")
+
+
+def load_samples(run_dir: str) -> dict[str, dict]:
+    """Saved samples per temperature key, as written by the sample task."""
     folder = os.path.join(run_dir, "samples")
     files = sorted(f for f in os.listdir(folder) if f.startswith("samples_t")) \
         if os.path.isdir(folder) else []
     if not files:
         raise SystemExit(f"No samples in {folder}; run: python predict.py sample {run_dir}")
     samples = [torch.load(os.path.join(folder, f), weights_only=True) for f in files]
-    return {s["temperature"]: s for s in sorted(samples, key=lambda s: s["temperature"])}
+    # older files hold one float temperature shared by every level
+    keyed = {s["temperature"] if isinstance(s["temperature"], str) else f"{s['temperature']:g}": s
+             for s in samples}
+    return {key: keyed[key] for key in sorted(keyed, key=key_order)}
 
 
 def load_codes(run_dir: str, split: str) -> dict[str, torch.Tensor]:
@@ -176,37 +207,57 @@ def reconstruct(args, device):
 
 # Sampling.
 
+def temperature_settings(levels: tuple[str, ...], temperatures: list[float],
+                         bottom_temperatures: list[float] | None) -> list[dict[str, float]]:
+    """
+    Each level's temperature for every setting to sample. Without
+    bottom_temperatures, every level shares each of temperatures; with them, the
+    top prior takes each of temperatures and the bottom prior each of
+    bottom_temperatures, for every pair.
+    """
+    if not bottom_temperatures:
+        return [{level: t for level in levels} for t in temperatures]
+    if "top" not in levels:
+        raise SystemExit("--bottom-temperatures needs a two-level model")
+    return [{"top": t_top, "bottom": t_bottom}
+            for t_top in temperatures for t_bottom in bottom_temperatures]
+
+
 @torch.no_grad()
-def sample_images(vqvae, priors: dict, n: int, temperature: float, seed: int,
+def sample_images(vqvae, priors: dict, n: int, temperature: dict[str, float], seed: int,
                   batch_size: int, device: torch.device) -> dict[str, torch.Tensor]:
     """
     Generate n slices from the priors, then decode them with the stage-1 decoder.
     Two-level: the top prior, then the bottom prior given the top codes.
-    Single-level: the one prior over the bottom codes. One generator seeded once
-    drives every batch, so a given (seed, batch_size) always gives the same samples.
+    Single-level: the one prior over the bottom codes. temperature maps each
+    level to its sampling temperature. One generator seeded once drives every
+    batch, so a given (seed, batch_size) always gives the same samples, and
+    settings that share a top temperature share their top code maps.
     """
     generator = torch.Generator(device=device).manual_seed(seed)
     out = {"images": [], **{level: [] for level in priors}}
     for start in range(0, n, batch_size):
         b = min(batch_size, n - start)
         if "top" in priors:
-            top = priors["top"].sample(b, temperature, generator)
-            codes = {"top": top, "bottom": priors["bottom"].sample(top, temperature, generator)}
+            top = priors["top"].sample(b, temperature["top"], generator)
+            codes = {"top": top,
+                     "bottom": priors["bottom"].sample(top, temperature["bottom"], generator)}
         else:
-            codes = {"bottom": priors["bottom"].sample(b, temperature, generator)}
+            codes = {"bottom": priors["bottom"].sample(b, temperature["bottom"], generator)}
         out["images"].append(vqvae.decode_codes(codes["bottom"], codes.get("top")).clamp(0, 1).cpu())
         for level, c in codes.items():
             out[level].append(c.to(torch.int16).cpu())
-        print(f"  T={temperature:g}: {start + b}/{n} samples")
+        print(f"  T={temperature_key(temperature)}: {start + b}/{n} samples")
     return {k: torch.cat(v) for k, v in out.items()}
 
 
 def sample(args, device):
     """
-    Sample every temperature, saving each one as soon as it finishes. A
-    temperature already saved with the same number of samples, seed and batch
-    size is skipped (unless --overwrite), so a job cut off by its time limit
-    can be resubmitted and carries on from the next temperature.
+    Sample every temperature setting, saving each one as soon as it finishes. A
+    setting already saved with the same number of samples, seed and batch size
+    is skipped (unless --overwrite), so a job cut off by its time limit can be
+    resubmitted and carries on from the next setting. With --bottom-temperatures,
+    the two priors are swept separately (see temperature_settings).
     """
     vqvae, ckpt = load_vqvae(args.run_dir, device)
     priors, prior_ckpts = {}, {}
@@ -215,7 +266,8 @@ def sample(args, device):
         print(f"Loaded {level} prior from epoch {prior_ckpts[level]['epoch']} "
               f"(val {prior_ckpts[level]['metrics']['val_bits_per_code']:.4f} bits/code)")
     sample_cfg = prior_ckpts["bottom"]["config"]["sample"]
-    temperatures = args.temperatures or sample_cfg["temperatures"]
+    sweep = temperature_settings(vqvae.level_names, args.temperatures or sample_cfg["temperatures"],
+                                 args.bottom_temperatures)
     n = args.n_samples or sample_cfg["n_samples"]
 
     seed, batch_size = sample_cfg["seed"], sample_cfg["batch_size"]
@@ -226,33 +278,34 @@ def sample(args, device):
     previous = read_results(args.run_dir, "sample") or {}
     timing = previous.get("temperatures", {})
     previews = {}
-    for t in temperatures:
-        path = os.path.join(samples_dir, f"samples_t{t:g}.pt")
-        done = timing.get(f"{t:g}")
+    for temperature in sweep:
+        key = temperature_key(temperature)
+        path = os.path.join(samples_dir, f"samples_t{file_tag(key)}.pt")
+        done = timing.get(key)
         # older results files keep these settings once, at the top level
         settings = {k: (done or {}).get(k, previous.get(k))
                     for k in ("n_samples", "seed", "batch_size")}
         if (not args.overwrite and done and os.path.exists(path)
                 and settings == {"n_samples": n, "seed": seed, "batch_size": batch_size}):
-            print(f"  T={t:g}: already sampled, skipping (--overwrite to redo)")
-            previews[t] = torch.load(path, weights_only=True)["images"][:args.n].float()
+            print(f"  T={key}: already sampled, skipping (--overwrite to redo)")
+            previews[key] = torch.load(path, weights_only=True)["images"][:args.n].float()
             continue
 
         synchronize(device)
         start = time.perf_counter()
-        out = sample_images(vqvae, priors, n, t, seed, batch_size, device)
+        out = sample_images(vqvae, priors, n, temperature, seed, batch_size, device)
         synchronize(device)
         seconds = time.perf_counter() - start
-        print(f"  T={t:g}: {seconds:.0f}s, {seconds / n:.2f}s per image")
+        print(f"  T={key}: {seconds:.0f}s, {seconds / n:.2f}s per image")
         save_atomic({"images": out["images"].half(), **{lv: out[lv] for lv in priors},
-                     "temperature": t, "seed": seed}, path)
-        timing[f"{t:g}"] = {"seconds": seconds, "seconds_per_image": seconds / n,
-                            "n_samples": n, "seed": seed, "batch_size": batch_size,
-                            "device": device_name}
+                     "temperature": key, "level_temperatures": temperature, "seed": seed}, path)
+        timing[key] = {"seconds": seconds, "seconds_per_image": seconds / n,
+                       "level_temperatures": temperature, "n_samples": n, "seed": seed,
+                       "batch_size": batch_size, "device": device_name}
         write_results(args.run_dir, "sample", {
             "model": model_label(ckpt["config"]), "device": device_name, "n_samples": n,
             "batch_size": batch_size, "seed": seed, "temperatures": timing})
-        previews[t] = out["images"][:args.n]
+        previews[key] = out["images"][:args.n]
 
     plot_samples(previews, figure_path(args, "samples"))
     plot_prior_history({level: read_history(prior_dir(args.run_dir, level)) for level in priors},
@@ -290,11 +343,11 @@ def audit(args, device):
         "temperatures": {}}
     similarities = {"test (reference)": ref_ssim}
 
-    for t, s in load_samples(args.run_dir).items():
+    for key, s in load_samples(args.run_dir).items():
         images = s["images"].float()
         nn_ssim, nn_idx = nearest_by_ssim(images, train_images, device)
         agreement = {lv: max_code_agreement(s[lv], train_codes[lv], device)[0] for lv in levels}
-        results["temperatures"][f"{t:g}"] = {
+        results["temperatures"][key] = {
             "n": len(images),
             "nn_ssim": summarise(nn_ssim),
             "above_reference_max": int((nn_ssim > ref_max).sum()),
@@ -303,13 +356,13 @@ def audit(args, device):
                                for lv, a in agreement.items()},
             "code_usage": {lv: code_usage(s[lv], k) for lv in levels},
         }
-        similarities[f"samples T={t:g}"] = nn_ssim
+        similarities[f"samples T={key}"] = nn_ssim
 
         closest = nn_ssim.argsort(descending=True)[:args.n]
         captions = [f"SSIM {nn_ssim[i]:.3f}\ntrain case {train_records[nn_idx[i]].case:03d} "
                     f"sl {train_records[nn_idx[i]].slice}" for i in closest]
         plot_nn_pairs(images[closest], train_images[nn_idx[closest].to(device)].cpu(), captions,
-                      figure_path(args, f"nn_pairs_t{t:g}"))
+                      figure_path(args, f"nn_pairs_t{file_tag(key)}"))
 
     write_results(args.run_dir, "audit", results)
     plot_nn_histogram(similarities, "test (reference)", figure_path(args, "nn_audit"))
@@ -342,16 +395,16 @@ def fid(args, device):
         "real test": inception_features(slices["test"].images, device),
         "test reconstructions": inception_features(
             reconstruct_all(vqvae, slices["test"].images, device), device),
-        **{f"samples T={t:g}": inception_features(s["images"], device)
-           for t, s in samples.items()},
+        **{f"samples T={key}": inception_features(s["images"], device)
+           for key, s in samples.items()},
     }
     train = features["real train"]
     results = {"model": model_label(cfg), "n_train": len(train),
                "reference": {"test_vs_train": frechet_distance(features["real test"], train),
                              "test_reconstructions_vs_train":
                                  frechet_distance(features["test reconstructions"], train)},
-               "temperatures": {f"{t:g}": frechet_distance(features[f"samples T={t:g}"], train)
-                                for t in samples}}
+               "temperatures": {key: frechet_distance(features[f"samples T={key}"], train)
+                                for key in samples}}
     write_results(args.run_dir, "fid", results)
     print(f"FID vs train: test {results['reference']['test_vs_train']:.1f}, test reconstructions "
           f"{results['reference']['test_reconstructions_vs_train']:.1f}, " +
@@ -369,6 +422,107 @@ def fid(args, device):
                   perplexity=min(30.0, (len(x) - 1) / 3)).fit_transform(x)
     plot_embedding(points, labels, figure_path(args, "tsne"),
                    f"t-SNE of Inception features, {model_label(cfg)}")
+
+
+# Failure autopsy.
+
+def parse_setting(setting: str) -> str:
+    """A --setting such as '1.1/0.5', '1.0/0.5' or '0.8' as its temperature key."""
+    values = [float(v) for v in setting.split("/")]
+    return temperature_key(dict(zip(("top", "bottom"), values)))
+
+
+def structure_errors(sample: torch.Tensor, neighbour: torch.Tensor,
+                     mask: np.ndarray) -> dict[str, float]:
+    """Mean |sample - neighbour| inside each structure of the neighbour's mask."""
+    error = (sample.float() - neighbour.float()).abs().squeeze().numpy()
+    return {name: float(error[mask == label].mean())
+            for label, name in MASK_LABELS.items() if (mask == label).any()}
+
+
+def autopsy(args, device):
+    """
+    Failure autopsy at one sampling setting (--setting): flawed samples beside
+    their nearest training slice, with that slice's segmentation mask outlined,
+    so a distorted, misplaced or missing structure shows against real anatomy.
+    The flawed samples are --indices, or by default the --n least like any
+    training slice (lowest nearest-train SSIM), a fixed rule rather than a hand
+    pick. A sheet of the 4 * --n lowest helps choose --indices instead.
+
+    A structure's error ratio is the mean |sample - nearest| inside it over the
+    median of the same error across every sample at this setting: 2.0 is twice
+    the usual mismatch there. Settings sharing the top temperature share the
+    top code maps, so the same sample at the other bottom temperatures shows
+    whether a flaw comes from the top prior (it persists) or the bottom prior
+    (it changes).
+    """
+    if not args.setting:
+        raise SystemExit("autopsy needs --setting, e.g. --setting 1.1/0.5")
+    cfg = load_checkpoint(args.run_dir)["config"]
+    train = load_split(args, cfg, "train")
+    samples = load_samples(args.run_dir)
+    key = parse_setting(args.setting)
+    if key not in samples:
+        raise SystemExit(f"No samples at T={key}; saved: {', '.join(samples)}")
+    s = samples[key]
+    images = s["images"].float()
+    nn_ssim, nn_idx = nearest_by_ssim(images, train.images.to(device), device)
+    nn_idx = nn_idx.cpu()
+    order = nn_ssim.argsort()  # least like any training slice first
+    chosen = args.indices or order[:args.n].tolist()
+    if not all(0 <= i < len(images) for i in chosen):
+        raise SystemExit(f"--indices must be in [0, {len(images)})")
+
+    masks = {int(j): load_mask(train.records[j], cfg["data"]["size"]) for j in nn_idx.unique()}
+    errors = [structure_errors(images[i], train.images[nn_idx[i]], masks[int(nn_idx[i])])
+              for i in range(len(images))]
+    typical = {name: float(np.median([e[name] for e in errors if name in e]))
+               for name in MASK_LABELS.values() if any(name in e for e in errors)}
+
+    # other bottom temperatures with this sample's top codes
+    idx = torch.tensor(chosen)
+    same_top = [k for k in samples if k != key and "top" in s
+                and key_order(k)[0] == key_order(key)[0] and len(samples[k]["top"]) > max(chosen)
+                and torch.equal(samples[k]["top"][idx], s["top"][idx])]
+    persistence = {k: ssim(samples[k]["images"].float(), images) for k in same_top}
+
+    neighbours = train.images[nn_idx[idx]]
+    columns = {f"sample, T={key}": images[idx],
+               **{f"same top codes, T={k}": samples[k]["images"][idx] for k in same_top},
+               "nearest training slice": neighbours,
+               "sample + nearest's mask": images[idx],
+               "|sample - nearest|": (images[idx] - neighbours).abs()}
+    records = [train.records[nn_idx[i]] for i in chosen]
+    captions = [f"sample {i}\nnearest: case {r.case:03d} wk {r.week} sl {r.slice}\n"
+                f"SSIM {nn_ssim[i]:.3f}" for i, r in zip(chosen, records)]
+    plot_autopsy(columns, np.stack([masks[int(nn_idx[i])] for i in chosen]), captions,
+                 ("nearest training slice", "sample + nearest's mask", "|sample - nearest|"),
+                 figure_path(args, f"autopsy_t{file_tag(key)}"))
+    pool = order[:4 * args.n]
+    plot_candidates(images[pool], [f"sample {i}, SSIM {nn_ssim[i]:.3f}" for i in pool.tolist()],
+                    figure_path(args, f"autopsy_candidates_t{file_tag(key)}"))
+
+    rows = [{"index": i, "nearest": os.path.basename(r.path), "nearest_ssim": float(nn_ssim[i]),
+             "structures": sorted(errors[i], key=list(MASK_LABELS.values()).index),
+             "error_ratio": {name: e / typical[name] for name, e in errors[i].items()},
+             "same_top_ssim": {k: float(p[i]) for k, p in persistence.items()}}
+            for i, r in zip(chosen, records)]
+    write_results(args.run_dir, f"autopsy_t{file_tag(key)}", {
+        "model": model_label(cfg), "temperature": key, "n": len(images),
+        "selection": "--indices" if args.indices else "lowest nearest-train SSIM",
+        "typical_structure_error": typical,
+        "typical_same_top_ssim": {k: float(p.median()) for k, p in persistence.items()},
+        "samples": rows})
+
+    print(f"T={key}, {len(images)} samples; nearest-train SSIM median {nn_ssim.median():.3f}")
+    for row in rows:
+        ratios = ", ".join(f"{name} {v:.1f}x" for name, v in row["error_ratio"].items())
+        print(f"  sample {row['index']}: nearest {row['nearest']} (SSIM {row['nearest_ssim']:.3f})"
+              f"\n    error vs usual: {ratios}")
+        if row["same_top_ssim"]:
+            print("    SSIM to the same top codes at " + ", ".join(
+                f"T={k}: {v:.2f} (usual {persistence[k].median():.2f})"
+                for k, v in row["same_top_ssim"].items()))
 
 
 # Latent interpolation.
@@ -574,7 +728,8 @@ def report(args, device):
                 f"{smp['temperatures'][t]['seconds_per_image']:.2f}"
                 if smp and t in smp["temperatures"] else "–"])
     table("Generation and memorisation audit",
-          ["Model", "T", "FID ↓", "Nearest-train SSIM (median / max)", "Above reference max",
+          ["Model", "T (top/bottom)", "FID ↓", "Nearest-train SSIM (median / max)",
+           "Above reference max",
            "Max code agreement (top / bottom)", "Exact code copies", "Sampling s/image"], rows)
 
     rows = []
@@ -635,11 +790,21 @@ def parse_args():
     single.add_argument("--seed", type=int, default=0,
                         help="choice of slices for figures, interpolation pairs and t-SNE")
     single.add_argument("--temperatures", type=float, nargs="+",
-                        help="sampling temperatures (default: sample.temperatures in the config)")
+                        help="sampling temperatures shared by both priors, or the top prior's "
+                             "with --bottom-temperatures (default: sample.temperatures in the config)")
+    single.add_argument("--bottom-temperatures", type=float, nargs="+",
+                        help="bottom-prior temperatures: sample every (top, bottom) pair of "
+                             "--temperatures and these, e.g. --temperatures 0.7 0.8 0.9 "
+                             "--bottom-temperatures 0.7 0.8 0.9")
     single.add_argument("--n-samples", type=int,
                         help="samples per temperature (default: sample.n_samples in the config)")
     single.add_argument("--overwrite", action="store_true",
                         help="resample temperatures that are already saved (sample)")
+    single.add_argument("--setting",
+                        help="sampling setting to autopsy: a shared temperature or top/bottom, "
+                             "e.g. 1.1/0.5")
+    single.add_argument("--indices", type=int, nargs="+",
+                        help="samples to autopsy (default: the --n least like any training slice)")
     single.add_argument("--pairs", type=int, default=4, help="interpolation pairs")
     single.add_argument("--steps", type=int, default=9, help="frames per interpolation")
     multi = argparse.ArgumentParser(add_help=False, parents=[common])
@@ -648,7 +813,7 @@ def parse_args():
                        help="training steps profiled per model for peak VRAM (resources)")
 
     sub = p.add_subparsers(dest="task", required=True)
-    for task in (*TASKS, "all"):
+    for task in (*TASKS, "all", "autopsy"):
         sub.add_parser(task, parents=[single])
     for task in ("resources", "report"):
         sub.add_parser(task, parents=[multi])
