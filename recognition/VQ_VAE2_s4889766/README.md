@@ -232,6 +232,27 @@ Even the closest samples at this setting stop at the reference maximum (SSIM 0.4
   - No sample shares more than 17.8% of its top codes, or 24.1% of its bottom codes, with any training slice. That is far from a copy.
   - Both figures are still above the test patients' 10.2% and 16.2%, so at the code level the samples sit closer to the training data than new patients do.
 
+### Failure autopsy
+The audits above look at the samples closest to the training set. The autopsy looks at the other end: the samples at 1.1/0.5 least like any training slice, meaning those with the lowest nearest-train SSIM. `predict.py autopsy` picks them by this fixed rule rather than by eye. It shows each one beside the same sample drawn at the other bottom temperatures, which share its top codes. A flaw that persists across them comes from the top prior, and one that changes comes from the bottom prior.
+
+<img src="assets/results/autopsy_candidates_t1.1_0.5.png" width="100%">
+
+*The 16 samples at 1.1/0.5 least like any training slice, with their nearest-train SSIM.*
+
+<img src="assets/results/autopsy_t1.1_0.5.png" width="100%">
+
+*The four least like any training slice. From left to right: the sample, the same top codes at $T_\text{bottom} = 0.6$ and $0.7$, the nearest training slice, and the absolute difference between the sample and that slice. Each row is labelled with the nearest slice's patient, week and slice number, and its SSIM.*
+
+- All 16 are visibly broken: the body is washed out to near-white, and the organs are replaced by dark streaks and blotches. The femoral heads appear as distorted rings or not at all. Their nearest-train SSIM (0.14–0.20) is far below the test patients' typical 0.32. Ranking by SSIM could in principle pick plausible new slices instead, but here it picked genuine failures.
+- **The samples are too bright.** Every slice is scaled to [0, 1], and the brightest of the 11,460 training slices has a mean intensity of 0.38.
+  - 13 of the 16 samples exceed it (0.39–0.63). The other three are among the brightest 2% of training slices.
+  - The uncurated samples at this setting sit at 0.11–0.28, around the training median of 0.21.
+- **They sit beyond the bright edge of the training data.**
+  - Their nearest training slices are among the brightest 6% of the training set.
+  - Those slices come late in their volumes (slices 35–59 of 0–59), where training slices are brightest: the median intensity rises from 0.175 for slices 0–19 to 0.278 for slices 50–59.
+  - The samples overshoot even these, and the difference maps show error across the whole body rather than at one structure.
+- **The failure starts in the top codes.** With the same top codes, $T_\text{bottom} = 0.6$ and $0.7$ also give over-bright, broken slices (mean 0.40–0.53, still above every training slice). The body outline stays about the same, and only the interior detail changes, never into coherent anatomy. A colder bottom prior cannot rescue a bad top map. Whether the hot $T_\text{top}$ of 1.1 causes these failures needs the same autopsy at a cooler setting, such as 0.9/0.5.
+- **At least 13 of the 512 samples (2.5%) fail this way.** This is a lower bound, since only the 16 lowest were inspected. Because these samples are brighter than any training slice, a simple check against the brightest training slice would catch most of them before samples are shared.
 
 
 ## AI Usage Disclosure
